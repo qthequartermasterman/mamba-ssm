@@ -402,6 +402,10 @@ setup(
         "tilelang==0.1.8",
         "apache-tvm-ffi<=0.1.12",
         "quack-kernels>=0.3.4",
+        # nvidia-cutlass-dsl 4.6.0 is incompatible with mamba-ssm 2.3.2 but does not
+        # declare itself as such. Constrain the transitive libs-base package so
+        # the resolver keeps the 4.5.2.
+        "nvidia-cutlass-dsl-libs-base==4.5.2",
         # "causal_conv1d>=1.4.0",
     ],
 )
