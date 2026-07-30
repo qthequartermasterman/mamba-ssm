@@ -44,9 +44,16 @@ def _state_passing_fwd_kernel(
     HAS_SEQ_IDX: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid_b = tl.program_id(axis=1)
-    pid_h = tl.program_id(axis=2)
-    pid_m = tl.program_id(axis=0)
+    # if nchunks/nheads/stride products are large, may overflow int32, so use 64 bit
+    # https://github.com/triton-lang/triton/issues/1058
+    # PR #988 hardened the sibling ssd_chunk_scan/ssd_chunk_state/ssd_bmm/ssd_combined kernels but left
+    # state-passing on int32 offsets. At long sequence length `stride_states_batch = nchunks * nheads * dim`
+    # (and the accumulated `stride_states_chunk` in the loop below) grow large enough that
+    # `pid_b * stride_states_batch` overflows int32 for batch/head indices >= 2, so cast the program-ids to
+    # int64 to promote the whole offset chain (matching PR #988's fix on the sibling kernels).
+    pid_b = tl.program_id(axis=1).to(tl.int64)
+    pid_h = tl.program_id(axis=2).to(tl.int64)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     states_ptr += pid_b * stride_states_batch + pid_h * stride_states_head
     dA_cs_ptr += pid_b * stride_dA_cs_batch + pid_h * stride_dA_cs_head
     out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
@@ -121,9 +128,14 @@ def _state_passing_bwd_kernel(
     HAS_SEQ_IDX: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid_b = tl.program_id(axis=1)
-    pid_h = tl.program_id(axis=2)
-    pid_m = tl.program_id(axis=0)
+    # if nchunks/nheads/stride products are large, may overflow int32, so use 64 bit
+    # https://github.com/triton-lang/triton/issues/1058
+    # Backward twin of _state_passing_fwd_kernel: the same `stride_*_batch = nchunks * nheads * dim` blow-up plus
+    # the `(nchunks - 1) * stride_*_chunk` base offsets below overflow int32 for batch/head indices >= 2 at long
+    # sequence length, so cast the program-ids to int64 to promote the whole offset chain (matching PR #988).
+    pid_b = tl.program_id(axis=1).to(tl.int64)
+    pid_h = tl.program_id(axis=2).to(tl.int64)
+    pid_m = tl.program_id(axis=0).to(tl.int64)
     dstates_ptr += pid_b * stride_dstates_batch + pid_h * stride_dstates_head + (nchunks - 1) * stride_dstates_chunk
     dA_cs_ptr += pid_b * stride_dA_cs_batch + pid_h * stride_dA_cs_head + (nchunks - 1) * stride_dA_cs_chunk
     ddA_cs_ptr += pid_b * stride_ddA_cs_batch + pid_h * stride_ddA_cs_head + (nchunks - 1) * stride_ddA_cs_chunk + pid_m
@@ -203,6 +215,19 @@ def _state_passing_fwd(states, dA_chunk_cumsum, initial_states=None, seq_idx=Non
         assert chunk_size is not None
         seqlen = seq_idx.shape[-1]
         assert seq_idx.shape == (batch, seqlen)
+    # The fused scan (ssd_combined) calls this helper directly, bypassing StatePassingFn's contiguity guards, and
+    # passes non-contiguous views: `states`/`initial_states` come from `rearrange(... "... p n -> ... (p n)")` and
+    # `dA_chunk_cumsum` is the `dA_cumsum[:, :, :, -1]` slice (inner stride == chunk_size). Collapsing them to
+    # contiguous shrinks the per-batch/head strides the kernel multiplies by pid, keeping int32 offsets small
+    # (belt-and-suspenders with the int64 program-id casts above).
+    if not states.is_contiguous():
+        states = states.contiguous()
+    if not dA_chunk_cumsum.is_contiguous():
+        dA_chunk_cumsum = dA_chunk_cumsum.contiguous()
+    if initial_states is not None and not initial_states.is_contiguous():
+        initial_states = initial_states.contiguous()
+    if seq_idx is not None and not seq_idx.is_contiguous():
+        seq_idx = seq_idx.contiguous()
     out_dtype = states.dtype if out_dtype is None else out_dtype
     out = torch.empty((batch, nchunks, nheads, dim), device=states.device, dtype=out_dtype)
     final_states = torch.empty((batch, nheads, dim), device=states.device, dtype=torch.float32)
@@ -238,6 +263,20 @@ def _state_passing_bwd(
         assert chunk_size is not None
         seqlen = seq_idx.shape[-1]
         assert seq_idx.shape == (batch, seqlen)
+    # Backward twin of _state_passing_fwd: the fused scan (ssd_combined) calls this directly with rearranged/sliced
+    # views (`states`/`dout`/`dfinal_states` from rearrange, `dA_chunk_cumsum` the `dA_cumsum[:, :, :, -1]` slice).
+    # Collapse them to contiguous so the per-batch/head strides the kernel multiplies by pid stay small, keeping
+    # int32 offsets bounded (belt-and-suspenders with the int64 program-id casts in the bwd kernel).
+    if not states.is_contiguous():
+        states = states.contiguous()
+    if not dA_chunk_cumsum.is_contiguous():
+        dA_chunk_cumsum = dA_chunk_cumsum.contiguous()
+    if not dout.is_contiguous():
+        dout = dout.contiguous()
+    if dfinal_states is not None and not dfinal_states.is_contiguous():
+        dfinal_states = dfinal_states.contiguous()
+    if seq_idx is not None and not seq_idx.is_contiguous():
+        seq_idx = seq_idx.contiguous()
     dstates = torch.empty_like(dout, dtype=dstates_dtype if dstates_dtype is not None else dout.dtype)
     if states_dtype is not None and states_dtype != states.dtype:
         states_converted = torch.empty_like(states, dtype=dstates_dtype if dstates_dtype is not None else dout.dtype)
