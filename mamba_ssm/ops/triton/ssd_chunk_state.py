@@ -54,9 +54,13 @@ def _chunk_cumsum_fwd_kernel(
     HAS_DT_BIAS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_CHUNK: tl.constexpr,
 ):
-    pid_b = tl.program_id(axis=0)
-    # if dt is long, may cause problems, so use 64 bit
+    # pid_b * stride_dt_batch can exceed int32 range when dt is a
+    # non-contiguous slice of a wide fused projection, e.g. batch=4,
+    # seqlen=40_960, parent_width=35_072 gives stride_dt_batch=1_436_549_120,
+    # so pid_b=2 alone already gives 2_873_098_240 > 2**31 - 1. A similar
+    # problem exists for the pid_c term below.
     # https://github.com/triton-lang/triton/issues/1058
+    pid_b = tl.program_id(axis=0).to(tl.int64)
     pid_c = tl.program_id(axis=1).to(tl.int64)
     pid_h = tl.program_id(axis=2)
     dt_ptr += pid_b * stride_dt_batch + pid_c * chunk_size * stride_dt_seqlen
@@ -123,9 +127,13 @@ def _chunk_cumsum_bwd_kernel(
     BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_CHUNK: tl.constexpr,
     DETERMINISTIC_REDUCTION: tl.constexpr,
 ):
-    pid_b = tl.program_id(axis=0)
-    # if dt is long, may cause problems, so use 64 bit
+    # pid_b * stride_dt_batch can exceed int32 range when dt is a
+    # non-contiguous slice of a wide fused projection, e.g. batch=4,
+    # seqlen=40_960, parent_width=35_072 gives stride_dt_batch=1_436_549_120,
+    # so pid_b=2 alone already gives 2_873_098_240 > 2**31 - 1. A similar
+    # problem exists for the pid_c term below.
     # https://github.com/triton-lang/triton/issues/1058
+    pid_b = tl.program_id(axis=0).to(tl.int64)
     pid_c = tl.program_id(axis=1).to(tl.int64)
     pid_h = tl.program_id(axis=2)
     ddt_out_ptr += pid_b * stride_ddt_out_batch + pid_c * stride_ddt_out_chunk
