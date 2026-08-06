@@ -31,8 +31,7 @@ def _swiglu_fwd_kernel(
     BLOCK_N: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
-    # if row * stride_x_row is large, may overflow int32, so use 64 bit
-    # https://github.com/triton-lang/triton/issues/1058
+    # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
     row = tl.program_id(0).to(tl.int64)
     start_col = tl.program_id(1) * BLOCK_N
     X += row * stride_x_row
@@ -95,8 +94,7 @@ def _swiglu_bwd_kernel(
     RECOMPUTE_OUTPUT: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
-    # if row * stride_x_row is large, may overflow int32, so use 64 bit
-    # https://github.com/triton-lang/triton/issues/1058
+    # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
     row = tl.program_id(0).to(tl.int64)
     start_col = tl.program_id(1) * BLOCK_N
     X += row * stride_x_row

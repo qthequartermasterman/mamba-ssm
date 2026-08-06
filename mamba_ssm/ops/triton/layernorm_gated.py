@@ -63,8 +63,7 @@ def _layer_norm_fwd_1pass_kernel(
     IS_RMS_NORM: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
-    # if row * stride_x_row is large, may overflow int32, so use 64 bit
-    # https://github.com/triton-lang/triton/issues/1058
+    # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
     row = tl.program_id(0).to(tl.int64)
     group = tl.program_id(1)
     X += row * stride_x_row + group * N
@@ -187,8 +186,7 @@ def _layer_norm_bwd_kernel(
     BLOCK_N: tl.constexpr,
 ):
     # Map the program id to the elements of X, DX, and DY it should compute.
-    # if row_start * stride_x_row is large, may overflow int32, so use 64 bit
-    # https://github.com/triton-lang/triton/issues/1058
+    # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
     row_block_id = tl.program_id(0).to(tl.int64)
     group = tl.program_id(1)
     row_start = row_block_id * rows_per_program
