@@ -1,24 +1,19 @@
-import math
-
 import torch
 
 from mamba_ssm.ops.triton.layer_norm import rms_norm_fn
 
+from overflow_test_utils import bwd_row_start_max
+
 
 def test_rms_norm_large_row_count_no_overflow() -> None:
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
-    # Backward launches only sm_count programs (not one per row), so its
-    # max row_start is well under M - 1 -- N needs enough headroom that
-    # the backward case overflows too, not just M * N for forward.
     device = 'cuda'
     torch.manual_seed(0)
     N = 32_768  # hard cap: layer_norm.py raises if group_size/N exceeds 64KB / dtype_size
     M = 80_000  # (sm_count - 1) * ceil(M / sm_count) * N still clears 2**31 - 1 with margin (asserted below)
 
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    rows_per_program = math.ceil(M / sm_count)
-    bwd_row_start_max = (sm_count - 1) * rows_per_program
-    assert bwd_row_start_max * N > 2**31 - 1, (
+    assert bwd_row_start_max(M, sm_count) * N > 2**31 - 1, (
         f"test parameters too small to overflow the backward kernel on this GPU "
         f"(sm_count={sm_count}): increase N"
     )
