@@ -12,7 +12,6 @@ from mamba_ssm.ops.triton.ssd_chunk_state import (
     chunk_state,
     chunk_state_varlen,
 )
-from mamba_ssm.ops.triton import ssd_combined
 from mamba_ssm.ops.triton.ssd_combined import (
     mamba_chunk_scan_combined,
     _mamba_chunk_scan_combined_fwd,
@@ -266,18 +265,12 @@ def test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow() -> None
                                    msg=f"{name}.grad mismatch vs contiguous-equivalent")
 
 
-def test_mamba_chunk_scan_combined_bwd_dout_coercion_not_load_bearing(monkeypatch) -> None:
-    # _mamba_chunk_scan_combined_bwd coerces dout to .contiguous() via
-    # _coerce_contiguous_dout, see TODO: LinkToFutureIssueInMamba. dout is
-    # the incoming gradient from autograd, so unlike x/dt/B/C (all
+def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow() -> None:
+    # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
+    # dout is the incoming gradient from autograd, so unlike x/dt/B/C (all
     # produced internally by our own ops), it can arrive non-contiguous
     # with an arbitrary, caller-controlled large stride -- e.g. sliced out
     # of a wider fused gradient tensor upstream.
-    #
-    # Empirically, bypassing the coercion does NOT break the backward pass
-    # here: the kernels' own int64 fixes already handle the large stride
-    # correctly, same conclusion as the two coercions removed in prior
-    # commits.
     device = 'cuda'
     skip_if_insufficient_gpu_memory(device, required_gib=6)
 
@@ -299,8 +292,7 @@ def test_mamba_chunk_scan_combined_bwd_dout_coercion_not_load_bearing(monkeypatc
     dt = F.softplus(torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=device) - 4)
     A = -torch.rand(nheads, dtype=torch.float32, device=device) - 0.01
 
-    out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(
-        x, dt, A, B, C, chunk_size, D=D)
+    out, *_ = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D)
 
     dout_parent = torch.randn(batch, seqlen, parent_width, dtype=torch.float32, device=device)
     dout = dout_parent[:, :, -nheads * headdim:].view(batch, seqlen, nheads, headdim)
@@ -311,8 +303,8 @@ def test_mamba_chunk_scan_combined_bwd_dout_coercion_not_load_bearing(monkeypatc
     def run(dout_):
         return _mamba_chunk_scan_combined_bwd(dout_, x, dt, A, B, C, out, chunk_size, D=D)
 
-    dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = run(dout)
-    dx_ref, ddt_ref, dA_ref, dB_ref, dC_ref, dD_ref, dz_ref, ddt_bias_ref, dinitial_states_ref = run(dout_c)
+    dx, ddt, dA, dB, dC, dD, *_ = run(dout)
+    dx_ref, ddt_ref, dA_ref, dB_ref, dC_ref, dD_ref, *_ = run(dout_c)
     torch.cuda.synchronize(device)
     # dA/dD are summed over all ~900 chunks; summing in a different order
     # (contiguous vs. wide-sliced memory layout) causes tiny float roundoff
@@ -324,18 +316,6 @@ def test_mamba_chunk_scan_combined_bwd_dout_coercion_not_load_bearing(monkeypatc
         assert torch.isfinite(g).all(), f"{name} has non-finite values"
         rtol, atol = tols.get(name, (None, None))
         torch.testing.assert_close(g, g_ref, rtol=rtol, atol=atol, msg=f"{name} mismatch vs contiguous dout")
-
-    # Bypass _coerce_contiguous_dout entirely and confirm the kernels still
-    # produce the same result without it.
-    monkeypatch.setattr(ssd_combined, "_coerce_contiguous_dout", lambda dout_: dout_)
-    dx_b, ddt_b, dA_b, dB_b, dC_b, dD_b, dz_b, ddt_bias_b, dinitial_states_b = run(dout)
-    torch.cuda.synchronize(device)
-
-    for name, g, g_ref in [("dx", dx_b, dx_ref), ("ddt", ddt_b, ddt_ref), ("dA", dA_b, dA_ref),
-                           ("dB", dB_b, dB_ref), ("dC", dC_b, dC_ref), ("dD", dD_b, dD_ref)]:
-        assert torch.isfinite(g).all(), f"{name} (bypassed) has non-finite values"
-        rtol, atol = tols.get(name, (None, None))
-        torch.testing.assert_close(g, g_ref, rtol=rtol, atol=atol, msg=f"{name} (bypassed) mismatch vs coerced")
 
 
 def test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow() -> None:
