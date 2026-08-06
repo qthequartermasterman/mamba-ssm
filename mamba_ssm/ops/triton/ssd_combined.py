@@ -404,14 +404,19 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
         return out, out_x, dt, dA_cumsum, states, final_states, varlen_states
 
 
+def _coerce_contiguous_dout(dout):
+    # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba. Factored out
+    # (rather than inlined) so tests can monkeypatch it to a no-op and
+    # confirm it's still needed given the kernels' own int64 fixes.
+    return dout if dout.is_contiguous() else dout.contiguous()
+
+
 def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None, z=None,
                                    dt_bias=None, initial_states=None, dfinal_states=None, seq_idx=None, dt_softplus=False,
                                    dt_limit=(0.0, float("inf")),
                                    dx=None, ddt=None, dB=None, dC=None, dz=None, recompute_output=False,
                                    state_dtype=None):
-    # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
-    if not dout.is_contiguous():
-        dout = dout.contiguous()
+    dout = _coerce_contiguous_dout(dout)
     batch, seqlen, nheads, headdim = x.shape
     nchunks = math.ceil(seqlen / chunk_size)
     _, _, ngroups, dstate = B.shape
