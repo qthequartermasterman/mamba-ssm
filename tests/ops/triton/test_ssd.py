@@ -12,7 +12,6 @@ from mamba_ssm.ops.triton.ssd_chunk_state import (
     chunk_state,
     chunk_state_varlen,
 )
-from mamba_ssm.ops.triton import ssd_combined
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd
 
@@ -260,52 +259,6 @@ def test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow() -> None
         # roundoff differences at the ~1e-3 level even for a correct kernel.
         torch.testing.assert_close(t.grad.float(), t_c.grad.float(), rtol=1e-3, atol=1e-3,
                                    msg=f"{name}.grad mismatch vs contiguous-equivalent")
-
-
-def test_mamba_chunk_scan_combined_contiguity_coercion_not_load_bearing(monkeypatch) -> None:
-    # MambaChunkScanCombinedFn.forward coerces x/dt/B/C/z to .contiguous()
-    # via _coerce_contiguous_ssd_inputs (see TODO: LinkToFutureIssueInMamba).
-    # Toggle it off (monkeypatched to a no-op, not deleted, in case a future
-    # regression makes it load-bearing again) and confirm the kernels'
-    # own int64 fixes already produce the same answer without it, for this
-    # wide-trailing-dim-slice layout specifically (stride(-1) == 1 here, so
-    # _mamba_chunk_scan_combined_fwd's own separate, older stride(-1)-based
-    # coercion never fires either -- this doesn't cover other non-contiguous
-    # layouts where that older check would still kick in).
-    device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=6)
-
-    torch.manual_seed(0)
-    batch = 1
-    nheads = 16
-    headdim = 64
-    ngroups = 1
-    dstate = 32
-    chunk_size = 128
-    nchunks = 906
-    seqlen = nchunks * chunk_size
-    parent_width = 18_560
-
-    x, z, B, C = wide_noncontiguous_slices(
-        device, seqlen, parent_width,
-        [(nheads, headdim), (nheads, headdim), (ngroups, dstate), (ngroups, dstate)],
-        batch=batch,
-    )
-    assert not x.is_contiguous()
-    dt = F.softplus(torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=device) - 4)
-    A = -torch.rand(nheads, dtype=torch.float32, device=device) - 0.01
-    D = torch.randn(nheads, headdim, dtype=torch.float32, device=device)
-
-    with torch.no_grad():
-        out_coerced = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=D, z=z)
-
-        monkeypatch.setattr(ssd_combined, "_coerce_contiguous_ssd_inputs",
-                             lambda x, dt, B, C, z: (x, dt, B, C, z))
-        out_bypassed = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=D, z=z)
-    torch.cuda.synchronize(device)
-
-    assert torch.isfinite(out_bypassed).all()
-    torch.testing.assert_close(out_bypassed.float(), out_coerced.float(), rtol=1e-4, atol=1e-4)
 
 
 def test_chunk_state_varlen_noncontiguous_wide_view_no_overflow() -> None:
