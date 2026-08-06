@@ -12,8 +12,10 @@ from mamba_ssm.ops.triton.ssd_chunk_state import (
     chunk_state,
     chunk_state_varlen,
 )
+from mamba_ssm.ops.triton import ssd_combined
 from mamba_ssm.ops.triton.ssd_combined import (
     mamba_chunk_scan_combined,
+    mamba_split_conv1d_scan_combined,
     _mamba_chunk_scan_combined_fwd,
     _mamba_chunk_scan_combined_bwd,
 )
@@ -316,6 +318,76 @@ def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow() -> None:
         assert torch.isfinite(g).all(), f"{name} has non-finite values"
         rtol, atol = tols.get(name, (None, None))
         torch.testing.assert_close(g, g_ref, rtol=rtol, atol=atol, msg=f"{name} mismatch vs contiguous dout")
+
+
+def test_mamba_split_conv1d_scan_combined_fwd_contiguity_coercion_not_load_bearing(monkeypatch) -> None:
+    # MambaSplitConv1dScanCombinedFn.forward/backward coerce x/dt/B/C/z to
+    # .contiguous() via _coerce_contiguous_split_conv1d_inputs, see
+    # TODO: LinkToFutureIssueInMamba. x/B/C are non-contiguous here not via
+    # an artificial wide-slice trick but for real: causal_conv1d's output
+    # (xBC_conv) is contiguous, and x/B/C are plain torch.split() views of
+    # it along the last dim -- the same "large stride(1)" pattern as the
+    # MambaChunkScanCombinedFn.forward coercion already removed, except
+    # this one arises unavoidably on every real call, not just wide-slice
+    # edge cases. Sized at realistic Nemotron-scale in_proj width
+    # (dim + 2*ngroups*dstate = 18,560) so the split's stride(1) alone
+    # exceeds the int32 threshold once summed over ~900 chunks.
+    #
+    # Forward only (no .backward()): backward's extra buffers (recomputed
+    # xBC_conv, dzxbcdt, dxBC, dC/dB intermediates) land right at this
+    # GPU's ~47 GiB ceiling no matter how dim/ngroups/dstate are rebalanced
+    # -- every rebalancing just shifts which tensor blows up first. Forward
+    # exercises the identical _coerce_contiguous_split_conv1d_inputs call
+    # (shared by both), so this is still a direct check of that helper.
+    #
+    # Empirically, bypassing the coercion does NOT break forward here either
+    # -- fourth for four on this pattern; the kernels' own int64 fixes
+    # already handle it.
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=25)
+
+    torch.manual_seed(0)
+    batch = 1
+    # small dstate: the intermediate `states` tensor scales with
+    # nheads * headdim * dstate * nchunks, so most of width_conv1d needs to
+    # come from dim (nheads * headdim), not dstate, to keep memory down.
+    nheads = 289
+    headdim = 64
+    ngroups = 1
+    dstate = 32
+    dim = nheads * headdim
+    chunk_size = 128
+    nchunks = 906
+    seqlen = nchunks * chunk_size
+    conv_width = 4
+
+    width_conv1d = dim + 2 * ngroups * dstate
+    assert width_conv1d == 18_560
+
+    zxbcdt = torch.randn(batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads,
+                         dtype=torch.bfloat16, device=device)
+    conv1d_weight = torch.randn(width_conv1d, conv_width, dtype=torch.bfloat16, device=device)
+    conv1d_bias = torch.randn(width_conv1d, dtype=torch.bfloat16, device=device)
+    dt_bias = torch.randn(nheads, dtype=torch.float32, device=device)
+    A = -torch.rand(nheads, dtype=torch.float32, device=device) - 0.01
+    D = torch.randn(nheads, headdim, dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        out_ref = mamba_split_conv1d_scan_combined(
+            zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size)
+        torch.cuda.synchronize(device)
+        assert torch.isfinite(out_ref).all()
+
+        # Bypass _coerce_contiguous_split_conv1d_inputs entirely and confirm
+        # the kernels still produce the same result without it.
+        monkeypatch.setattr(ssd_combined, "_coerce_contiguous_split_conv1d_inputs",
+                            lambda x, dt, B, C, z: (x, dt, B, C, z))
+        out_bypassed = mamba_split_conv1d_scan_combined(
+            zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size)
+        torch.cuda.synchronize(device)
+
+    assert torch.isfinite(out_bypassed).all()
+    torch.testing.assert_close(out_bypassed, out_ref)
 
 
 def test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow() -> None:
