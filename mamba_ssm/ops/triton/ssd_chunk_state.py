@@ -54,11 +54,12 @@ def _chunk_cumsum_fwd_kernel(
     HAS_DT_BIAS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_CHUNK: tl.constexpr,
 ):
-    # if dt is long, may cause problems, so use 64 bit
+    # pid_b * stride_dt_batch can exceed int32 range when dt is a
+    # non-contiguous slice of a wide fused projection, e.g. batch=4,
+    # seqlen=40_960, parent_width=35_072 gives stride_dt_batch=1_436_549_120,
+    # so pid_b=2 alone already gives 2_873_098_240 > 2**31 - 1. A similar
+    # problem exists for the pid_c term below.
     # https://github.com/triton-lang/triton/issues/1058
-    # `dt`/`time_step` is a torch.split view of the wide in_proj output (stride_dt_batch = seqlen * d_in_proj,
-    # ~1.4e9 at seqlen 40960), so `pid_b * stride_dt_batch` overflows int32 for batch indices >= 2. Cast the
-    # batch program-id to int64 (PR #988 cast only the chunk axis here) so the offset chain promotes to int64.
     pid_b = tl.program_id(axis=0).to(tl.int64)
     pid_c = tl.program_id(axis=1).to(tl.int64)
     pid_h = tl.program_id(axis=2)
@@ -126,11 +127,12 @@ def _chunk_cumsum_bwd_kernel(
     BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_CHUNK: tl.constexpr,
     DETERMINISTIC_REDUCTION: tl.constexpr,
 ):
-    # if dt is long, may cause problems, so use 64 bit
+    # pid_b * stride_dt_batch can exceed int32 range when dt is a
+    # non-contiguous slice of a wide fused projection, e.g. batch=4,
+    # seqlen=40_960, parent_width=35_072 gives stride_dt_batch=1_436_549_120,
+    # so pid_b=2 alone already gives 2_873_098_240 > 2**31 - 1. A similar
+    # problem exists for the pid_c term below.
     # https://github.com/triton-lang/triton/issues/1058
-    # Backward twin of _chunk_cumsum_fwd_kernel: `dt` is the same wide in_proj split view (stride_dt_batch ~1.4e9
-    # at seqlen 40960), so `pid_b * stride_dt_batch` (line below) overflows int32 for batch indices >= 2. Cast the
-    # batch program-id to int64 (PR #988 cast only the chunk axis here) so the offset chain promotes to int64.
     pid_b = tl.program_id(axis=0).to(tl.int64)
     pid_c = tl.program_id(axis=1).to(tl.int64)
     pid_h = tl.program_id(axis=2)
