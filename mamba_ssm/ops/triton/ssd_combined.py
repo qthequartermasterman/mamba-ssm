@@ -71,9 +71,7 @@ def ensure_stride(inp):
     operate on a channels_last tensor for which stride[2] is not a multiple of 8, and in that case will
     raise an exception. This function prevents the aforementioned exception by returning a tensor with
     stride(1) equal to channels, by making the returned tensor contiguous, if inp.stride(1) is not
-    already a multiple of 8. The causal-conv CUDA kernels also store strides in uint32_t, so views whose
-    maximum relative element offset exceeds that range must be made contiguous to prevent batch offsets
-    from wrapping.
+    already a multiple of 8. Also avoids int32 overflow, see TODO: LinkToFutureIssueInMamba.
     """
     assert inp.shape[2] % 8 == 0, "Number of convolution channels is required to be a multiple of 8."
     if inp.numel() - 1 > _UINT32_MAX:
@@ -131,8 +129,7 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
     IS_TRITON_22: tl.constexpr,
     DETERMINISTIC_REDUCTION: tl.constexpr,
 ):
-    # if chunk_size/batch/stride products are large, may overflow int32, so use 64 bit
-    # https://github.com/triton-lang/triton/issues/1058
+    # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
     pid_bc = tl.program_id(axis=1).to(tl.int64)
     pid_c = pid_bc // batch
     pid_b = pid_bc - pid_c * batch
@@ -412,9 +409,7 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
                                    dt_limit=(0.0, float("inf")),
                                    dx=None, ddt=None, dB=None, dC=None, dz=None, recompute_output=False,
                                    state_dtype=None):
-    # Use full contiguity (not just a unit inner stride) so a `dout` arriving as a strided view with large
-    # batch/seqlen strides is collapsed to its packed minimum before the Triton kernels multiply those strides by
-    # batch/head/chunk program-ids, keeping int32 pointer offsets bounded on long sequences.
+    # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
     if not dout.is_contiguous():
         dout = dout.contiguous()
     batch, seqlen, nheads, headdim = x.shape
@@ -614,13 +609,7 @@ class MambaChunkScanCombinedFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), return_final_states=False, return_varlen_states=False, state_dtype=None):
         ctx.dt_dtype = dt.dtype
-        # Force the activation tensors contiguous at the single fused-scan entry point. When NemotronHMamba2Mixer
-        # feeds long sequences, x/dt/B/C/z arrive as `torch.split`/`.view` slices of the wide in_proj output whose
-        # batch/seqlen strides run ~1e9; the downstream Triton kernels multiply those strides by batch/head/chunk
-        # program-ids and overflow int32 (illegal memory access / garbage reads). Collapsing to contiguous here
-        # shrinks the strides to their packed minimum for every kernel in the fused path, and the coerced tensors
-        # are what `save_for_backward` stores, so the backward pass inherits the same safe layout. The guards are
-        # no-ops (a cheap stride check) when the caller already passes packed tensors.
+        # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
         if not x.is_contiguous():
             x = x.contiguous()
         if not dt.is_contiguous():
@@ -884,11 +873,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
         C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
         z = rearrange(z, "b l (h p) -> b l h p", h=nheads) if z is not None else None
-        # Mirror MambaChunkScanCombinedFn.forward: force the scan activations contiguous so the wide in_proj/conv-slice
-        # strides collapse before the fused Triton kernels multiply them by batch/head/chunk program-ids and overflow
-        # int32 (illegal memory access / garbage reads on long sequences). This all-ones-mask / mem-efficient entry
-        # point bypasses that function, so it needs the same coercion; the backward recomputes x/dt/B/C/z, so it coerces
-        # again there. The guards are no-ops when the tensors are already packed.
+        # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
         if not x.is_contiguous():
             x = x.contiguous()
         if not dt.is_contiguous():
@@ -975,15 +960,11 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         C = rearrange(C, "b l (g n) -> b l g n", g=ctx.ngroups)
         dzxbcdt = torch.empty_like(zxbcdt)
         dzx0, dz, dxBC_given, ddt_given = torch.split(dzxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
-        # Allocate the scan-gradient buffer contiguous (not `empty_like(xBC)`, which would inherit xBC's wide in_proj
-        # stride) so the dx/dB/dC slices the fused backward writes into are packed to their own minimum stride rather
-        # than the ~1e9 batch/seqlen strides. The subsequent causal_conv1d backward reads dxBC via ensure_stride and is
-        # agnostic to the (now packed) layout.
+        # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
         dxBC = torch.empty_like(xBC, memory_format=torch.contiguous_format)
         dx, dB, dC = torch.split(dxBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
         z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
-        # Match the forward: collapse the recomputed scan activations' wide strides before the fused backward kernels
-        # (this path recomputes x/dt/B/C/z from zxbcdt, so the forward's coercion does not carry over). No-ops when packed.
+        # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
         if not x.is_contiguous():
             x = x.contiguous()
         if not dt.is_contiguous():
@@ -1032,8 +1013,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             doutproj_weight, doutproj_bias = None, None
         dxBC_given_update, dweight, dbias, *_ = causal_conv1d_bwd_function(
             rearrange(ensure_stride(xBC), "b s d -> b d s"), conv1d_weight, conv1d_bias,
-            # Let causal-conv1d allocate packed dx. The dxBC_given slice inherits zxbcdt's wide batch stride, whose
-            # batch-3 offset exceeds 2**32 for Nemotron's 40k context and wraps into batch 0 in the CUDA kernel.
+            # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
             rearrange(ensure_stride(dxBC), "b s d -> b d s"), seq_idx, None, None,
             None, False, ctx.activation in ["silu", "swish"]
         )
