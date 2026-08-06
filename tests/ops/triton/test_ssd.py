@@ -13,7 +13,8 @@ from mamba_ssm.ops.triton.ssd_chunk_state import (
     chunk_state_varlen,
 )
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd
+from mamba_ssm.ops.triton import ssd_state_passing
+from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd, _state_passing_bwd
 
 from overflow_test_utils import skip_if_insufficient_gpu_memory, wide_noncontiguous_slices
 
@@ -259,6 +260,69 @@ def test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow() -> None
         # roundoff differences at the ~1e-3 level even for a correct kernel.
         torch.testing.assert_close(t.grad.float(), t_c.grad.float(), rtol=1e-3, atol=1e-3,
                                    msg=f"{name}.grad mismatch vs contiguous-equivalent")
+
+
+def test_state_passing_fwd_bwd_dA_chunk_cumsum_coercion_not_load_bearing(monkeypatch) -> None:
+    # _state_passing_fwd/_state_passing_bwd coerce dA_chunk_cumsum (among
+    # others) to .contiguous() via _coerce_contiguous, see
+    # TODO: LinkToFutureIssueInMamba. dA_chunk_cumsum is *always*
+    # non-contiguous in production (ssd_combined.py slices
+    # dA_cumsum[:, :, :, -1]), but only at overflow-relevant scale once
+    # nheads * nchunks is large. Reproduced directly here via a padded
+    # parent tensor -- states/dout stay small and cheap; only the padding
+    # dim (not nheads/nchunks/dim) needs to be huge to hit the threshold.
+    #
+    # Empirically, bypassing the coercion does NOT break fwd or bwd here:
+    # the kernels' own int64 casts on pid_b/pid_h/pid_m already handle the
+    # large stride correctly, same as the MambaChunkScanCombinedFn.forward
+    # coercion removed in a prior commit.
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=12)
+
+    torch.manual_seed(0)
+    batch = 1
+    nheads = 128
+    nchunks = 64
+    dim = 64
+    width = 300_000  # padding only, not a real chunk_size
+
+    parent = torch.randn(batch, nheads, nchunks, width, dtype=torch.float32, device=device)
+    dA_chunk_cumsum = parent[:, :, :, -1]
+    assert not dA_chunk_cumsum.is_contiguous()
+    assert (nheads - 1) * dA_chunk_cumsum.stride(1) > 2**31 - 1
+    dA_chunk_cumsum_c = dA_chunk_cumsum.contiguous()
+
+    states = torch.randn(batch, nchunks, nheads, dim, dtype=torch.float32, device=device)
+    dout = torch.randn(batch, nchunks, nheads, dim, dtype=torch.float32, device=device)
+
+    out, final_states = _state_passing_fwd(states, dA_chunk_cumsum)
+    out_ref, final_states_ref = _state_passing_fwd(states, dA_chunk_cumsum_c)
+    torch.cuda.synchronize(device)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, out_ref)
+    torch.testing.assert_close(final_states, final_states_ref)
+
+    dstates, ddA, _ = _state_passing_bwd(states, dA_chunk_cumsum, dout, has_initial_states=False)
+    dstates_ref, ddA_ref, _ = _state_passing_bwd(states, dA_chunk_cumsum_c, dout, has_initial_states=False)
+    torch.cuda.synchronize(device)
+    assert torch.isfinite(dstates).all()
+    torch.testing.assert_close(dstates, dstates_ref)
+    torch.testing.assert_close(ddA, ddA_ref)
+
+    # Now bypass _coerce_contiguous entirely and confirm the kernels break
+    # without it -- proving the coercion is load-bearing here, unlike the
+    # MambaChunkScanCombinedFn.forward coercion removed in a prior commit.
+    monkeypatch.setattr(ssd_state_passing, "_coerce_contiguous", lambda *tensors: tensors)
+    out_bypassed, final_states_bypassed = _state_passing_fwd(states, dA_chunk_cumsum)
+    dstates_bypassed, ddA_bypassed, _ = _state_passing_bwd(states, dA_chunk_cumsum, dout, has_initial_states=False)
+    torch.cuda.synchronize(device)
+
+    assert torch.isfinite(out_bypassed).all()
+    torch.testing.assert_close(out_bypassed, out_ref)
+    torch.testing.assert_close(final_states_bypassed, final_states_ref)
+    assert torch.isfinite(dstates_bypassed).all()
+    torch.testing.assert_close(dstates_bypassed, dstates_ref)
+    torch.testing.assert_close(ddA_bypassed, ddA_ref)
 
 
 def test_chunk_state_varlen_noncontiguous_wide_view_no_overflow() -> None:

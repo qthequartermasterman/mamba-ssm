@@ -15,6 +15,13 @@ from einops import rearrange, repeat
 from mamba_ssm.utils.determinism import autotune_configs
 
 
+def _coerce_contiguous(*tensors):
+    # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba. Factored out
+    # (rather than inlined) so tests can monkeypatch it to a no-op and
+    # confirm it's still needed given the kernels' own int64 fixes.
+    return tuple(t.contiguous() if t is not None and not t.is_contiguous() else t for t in tensors)
+
+
 @triton.autotune(
     configs=autotune_configs([
         triton.Config({'BLOCK_SIZE': 64}),
@@ -205,15 +212,8 @@ def _state_passing_fwd(states, dA_chunk_cumsum, initial_states=None, seq_idx=Non
         assert chunk_size is not None
         seqlen = seq_idx.shape[-1]
         assert seq_idx.shape == (batch, seqlen)
-    # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
-    if not states.is_contiguous():
-        states = states.contiguous()
-    if not dA_chunk_cumsum.is_contiguous():
-        dA_chunk_cumsum = dA_chunk_cumsum.contiguous()
-    if initial_states is not None and not initial_states.is_contiguous():
-        initial_states = initial_states.contiguous()
-    if seq_idx is not None and not seq_idx.is_contiguous():
-        seq_idx = seq_idx.contiguous()
+    states, dA_chunk_cumsum, initial_states, seq_idx = _coerce_contiguous(
+        states, dA_chunk_cumsum, initial_states, seq_idx)
     out_dtype = states.dtype if out_dtype is None else out_dtype
     out = torch.empty((batch, nchunks, nheads, dim), device=states.device, dtype=out_dtype)
     final_states = torch.empty((batch, nheads, dim), device=states.device, dtype=torch.float32)
@@ -249,17 +249,8 @@ def _state_passing_bwd(
         assert chunk_size is not None
         seqlen = seq_idx.shape[-1]
         assert seq_idx.shape == (batch, seqlen)
-    # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
-    if not states.is_contiguous():
-        states = states.contiguous()
-    if not dA_chunk_cumsum.is_contiguous():
-        dA_chunk_cumsum = dA_chunk_cumsum.contiguous()
-    if not dout.is_contiguous():
-        dout = dout.contiguous()
-    if dfinal_states is not None and not dfinal_states.is_contiguous():
-        dfinal_states = dfinal_states.contiguous()
-    if seq_idx is not None and not seq_idx.is_contiguous():
-        seq_idx = seq_idx.contiguous()
+    states, dA_chunk_cumsum, dout, dfinal_states, seq_idx = _coerce_contiguous(
+        states, dA_chunk_cumsum, dout, dfinal_states, seq_idx)
     dstates = torch.empty_like(dout, dtype=dstates_dtype if dstates_dtype is not None else dout.dtype)
     if states_dtype is not None and states_dtype != states.dtype:
         states_converted = torch.empty_like(states, dtype=dstates_dtype if dstates_dtype is not None else dout.dtype)
