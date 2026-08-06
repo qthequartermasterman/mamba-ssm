@@ -15,43 +15,11 @@ from mamba_ssm.ops.triton.ssd_chunk_state import (
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd
 
+from overflow_test_utils import skip_if_insufficient_gpu_memory, wide_noncontiguous_slices
+
 
 def detach_clone(*args):
     return tuple([arg.detach().clone().requires_grad_() if arg is not None else None for arg in args])
-
-
-def skip_if_insufficient_gpu_memory(device, required_gib):
-    # Shared by the int32-overflow regression tests below, which all need a
-    # wide (large stride(1)) tensor to trigger the bug -- skip rather than
-    # OOM on GPUs that are otherwise perfectly capable of running the suite.
-    total_memory = torch.cuda.get_device_properties(device).total_memory
-    required_memory = required_gib * 1024**3
-    if total_memory < required_memory:
-        pytest.skip(f"GPU has {total_memory / 1024**3:.1f} GiB, need >= {required_gib} GiB")
-
-
-def wide_noncontiguous_slices(device, seqlen, parent_width, shapes, batch=None):
-    """Allocate ONE (batch, seqlen, parent_width) parent tensor -- or
-    (seqlen, parent_width) if batch is None -- and return disjoint,
-    non-contiguous slices of it, one per entry in `shapes` (each a tuple of
-    trailing dims whose product is that slice's width). Every slice shares
-    the same large stride(1) == parent_width regardless of which columns it
-    takes, since slicing the last dim of a contiguous tensor doesn't change
-    the stride of an earlier dim -- so this is used by every int32-overflow
-    regression test below needing multiple wide, non-contiguous tensors, at
-    the memory cost of ONE parent instead of one per tensor.
-    """
-    widths = [math.prod(shape) for shape in shapes]
-    assert parent_width >= sum(widths)
-    parent_shape = (seqlen, parent_width) if batch is None else (batch, seqlen, parent_width)
-    parent = torch.randn(parent_shape, dtype=torch.bfloat16, device=device)
-    slices = []
-    offset = 0
-    for width, shape in zip(widths, shapes):
-        leading = () if batch is None else (batch,)
-        slices.append(parent[..., offset:offset + width].view(*leading, seqlen, *shape))
-        offset += width
-    return slices
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float16, torch.bfloat16])

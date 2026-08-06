@@ -10,6 +10,8 @@ from einops import rearrange, repeat
 
 from mamba_ssm.ops.triton.layernorm_gated import layernorm_fn, rms_norm_ref
 
+from overflow_test_utils import bwd_row_start_max
+
 
 @pytest.mark.parametrize("norm_before_gate", [True, False])
 # @pytest.mark.parametrize("norm_before_gate", [False])
@@ -106,9 +108,6 @@ def test_layer_norm_gated(d, dtype, wtype, has_bias, has_z, is_rms_norm, has_gro
 
 def test_layer_norm_gated_large_row_count_no_overflow() -> None:
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
-    # Backward launches only nrow_groups programs (not one per row), so its
-    # max row_start is well under M - 1 -- N needs enough headroom that
-    # the backward case overflows too, not just M * N for forward.
     device = 'cuda'
     torch.manual_seed(0)
     N = 32_768  # hard cap: layernorm_gated.py raises if group_size/N exceeds 64KB / dtype_size
@@ -120,9 +119,7 @@ def test_layer_norm_gated_large_row_count_no_overflow() -> None:
     num_warps = min(max(block_n // 256, 1), 8)
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     nrow_groups = math.ceil(sm_count * math.ceil(4 / num_warps))
-    rows_per_program = math.ceil(M / nrow_groups)
-    bwd_row_start_max = (nrow_groups - 1) * rows_per_program
-    assert bwd_row_start_max * N > 2**31 - 1, (
+    assert bwd_row_start_max(M, nrow_groups) * N > 2**31 - 1, (
         f"test parameters too small to overflow the backward kernel on this GPU "
         f"(sm_count={sm_count}, nrow_groups={nrow_groups}): increase N"
     )
