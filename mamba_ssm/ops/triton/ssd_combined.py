@@ -825,23 +825,6 @@ def mamba_conv1d_scan_ref(xBC, conv1d_weight, conv1d_bias, dt, A, chunk_size, D=
     return rearrange(out, "b s h p -> b s (h p)")
 
 
-def _coerce_contiguous_split_conv1d_inputs(x, dt, B, C, z):
-    # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba. Factored out
-    # (rather than inlined) so tests can monkeypatch it to a no-op and
-    # confirm it's still needed given the kernels' own int64 fixes.
-    if not x.is_contiguous():
-        x = x.contiguous()
-    if not dt.is_contiguous():
-        dt = dt.contiguous()
-    if not B.is_contiguous():
-        B = B.contiguous()
-    if not C.is_contiguous():
-        C = C.contiguous()
-    if z is not None and not z.is_contiguous():
-        z = z.contiguous()
-    return x, dt, B, C, z
-
-
 class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
 
     @staticmethod
@@ -876,7 +859,6 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
         C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
         z = rearrange(z, "b l (h p) -> b l h p", h=nheads) if z is not None else None
-        x, dt, B, C, z = _coerce_contiguous_split_conv1d_inputs(x, dt, B, C, z)
         if rmsnorm_weight is None:
             out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit, state_dtype=state_dtype)
             out = rearrange(out, "b s h p -> b s (h p)")
@@ -957,7 +939,6 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         dxBC = torch.empty_like(xBC, memory_format=torch.contiguous_format)
         dx, dB, dC = torch.split(dxBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
         z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
-        x, dt, B, C, z = _coerce_contiguous_split_conv1d_inputs(x, dt, B, C, z)
         dx = rearrange(dx, "b l (h p) -> b l h p", h=nheads)
         dB = rearrange(dB, "b l (g n) -> b l g n", g=ctx.ngroups)
         dC = rearrange(dC, "b l (g n) -> b l g n", g=ctx.ngroups)
