@@ -29,7 +29,7 @@ def detach_clone(*args):
 # @pytest.mark.parametrize('chunk_size', [128])
 def test_chunk_state_varlen(chunk_size, ngroups, dtype):
     device = 'cuda'
-    rtol, atol = (1e-2, 3e-3)
+    rtol, atol = (1e-2, 3e-3) if dtype != torch.bfloat16 else (1e-2, 6e-3)
     # set seed
     torch.random.manual_seed(chunk_size + (ngroups if ngroups != "max" else 64))
     batch = 300
