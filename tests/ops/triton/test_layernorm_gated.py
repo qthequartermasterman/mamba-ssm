@@ -105,27 +105,10 @@ def test_layer_norm_gated(d, dtype, wtype, has_bias, has_z, is_rms_norm, has_gro
 
 
 def test_layer_norm_gated_large_row_count_no_overflow() -> None:
-    # Regression test for a 32-bit pointer-arithmetic overflow in
-    # _layer_norm_fwd_1pass_kernel and _layer_norm_bwd_kernel:
-    # `row * stride_x_row` (fwd) / `row_start * stride_x_row` (bwd) was
-    # computed in 32-bit and silently wrapped once it exceeded 2**31 - 1,
-    # corrupting the pointer offset into `x` and causing a CUDA illegal
-    # memory access. Unlike the ssd_chunk_state.py overflow, this doesn't
-    # need a non-contiguous view -- an ordinarily contiguous (M, N) input is
-    # enough once M * N is large, since `row` ranges over all M flattened
-    # rows and stride_x_row == N. See
-    # https://github.com/triton-lang/triton/issues/1058.
-    # Also exercise backward: _layer_norm_bwd_kernel is backward-only and
-    # never runs under a forward-only, no_grad call -- a first version of
-    # this test only checked forward and would have missed a broken cast in
-    # the backward kernel entirely. The backward kernel launches far fewer
-    # programs than M (see _layer_norm_bwd's nrow_groups/rows_per_program),
-    # each covering a range of rows, so its largest `row_start` is well
-    # under M - 1 -- an N picked with only the forward case in mind can
-    # clear M * N but still fall short of overflowing the backward kernel.
-    # Size N with enough headroom and assert the backward overflow
-    # condition explicitly using the actual formula from _layer_norm_bwd,
-    # rather than assuming a fixed number of programs.
+    # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
+    # Backward launches only nrow_groups programs (not one per row), so its
+    # max row_start is well under M - 1 -- N needs enough headroom that
+    # the backward case overflows too, not just M * N for forward.
     device = 'cuda'
     torch.manual_seed(0)
     N = 32_768  # hard cap: layernorm_gated.py raises if group_size/N exceeds 64KB / dtype_size
