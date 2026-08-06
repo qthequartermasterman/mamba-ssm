@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.nn.functional as F
+import triton
 
 import pytest
 
@@ -101,3 +102,57 @@ def test_layer_norm_gated(d, dtype, wtype, has_bias, has_z, is_rms_norm, has_gro
     assert (weight.grad - weight_ref.grad).abs().max().item() <= 2 * (weight_pt.grad - weight_ref.grad).abs().max().item() + atol
     if has_bias:
         assert (bias.grad - bias_ref.grad).abs().max().item() <= 2 * (bias_pt.grad - bias_ref.grad).abs().max().item() + atol
+
+
+def test_layer_norm_gated_large_row_count_no_overflow() -> None:
+    # Regression test for a 32-bit pointer-arithmetic overflow in
+    # _layer_norm_fwd_1pass_kernel and _layer_norm_bwd_kernel:
+    # `row * stride_x_row` (fwd) / `row_start * stride_x_row` (bwd) was
+    # computed in 32-bit and silently wrapped once it exceeded 2**31 - 1,
+    # corrupting the pointer offset into `x` and causing a CUDA illegal
+    # memory access. Unlike the ssd_chunk_state.py overflow, this doesn't
+    # need a non-contiguous view -- an ordinarily contiguous (M, N) input is
+    # enough once M * N is large, since `row` ranges over all M flattened
+    # rows and stride_x_row == N. See
+    # https://github.com/triton-lang/triton/issues/1058.
+    # Also exercise backward: _layer_norm_bwd_kernel is backward-only and
+    # never runs under a forward-only, no_grad call -- a first version of
+    # this test only checked forward and would have missed a broken cast in
+    # the backward kernel entirely. The backward kernel launches far fewer
+    # programs than M (see _layer_norm_bwd's nrow_groups/rows_per_program),
+    # each covering a range of rows, so its largest `row_start` is well
+    # under M - 1 -- an N picked with only the forward case in mind can
+    # clear M * N but still fall short of overflowing the backward kernel.
+    # Size N with enough headroom and assert the backward overflow
+    # condition explicitly using the actual formula from _layer_norm_bwd,
+    # rather than assuming a fixed number of programs.
+    device = 'cuda'
+    torch.manual_seed(0)
+    N = 32_768  # hard cap: layernorm_gated.py raises if group_size/N exceeds 64KB / dtype_size
+    M = 80_000  # (nrow_groups - 1) * ceil(M / nrow_groups) * N still clears 2**31 - 1 with margin (asserted below)
+
+    element_size = 2  # bfloat16
+    max_fused_size = 65536 // element_size
+    block_n = min(max_fused_size, triton.next_power_of_2(N))
+    num_warps = min(max(block_n // 256, 1), 8)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    nrow_groups = math.ceil(sm_count * math.ceil(4 / num_warps))
+    rows_per_program = math.ceil(M / nrow_groups)
+    bwd_row_start_max = (nrow_groups - 1) * rows_per_program
+    assert bwd_row_start_max * N > 2**31 - 1, (
+        f"test parameters too small to overflow the backward kernel on this GPU "
+        f"(sm_count={sm_count}, nrow_groups={nrow_groups}): increase N"
+    )
+
+    x = torch.randn(M, N, dtype=torch.bfloat16, device=device, requires_grad=True)
+    weight = torch.randn(N, dtype=torch.float32, device=device, requires_grad=True)
+
+    out = layernorm_fn(x, weight, bias=None, is_rms_norm=True)
+    torch.cuda.synchronize(device)
+    assert out.shape == (M, N)
+    assert torch.isfinite(out).all()
+
+    out.sum().backward()
+    torch.cuda.synchronize(device)
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert weight.grad is not None and torch.isfinite(weight.grad).all()
