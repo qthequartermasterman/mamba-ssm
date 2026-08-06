@@ -78,7 +78,7 @@ def test_chunk_state_varlen(chunk_size, ngroups, dtype):
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
-def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_no_overflow():
+def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_no_overflow() -> None:
     # Regression test for a 32-bit pointer-arithmetic overflow shared by
     # _chunk_cumsum_fwd_kernel and _chunk_cumsum_bwd_kernel:
     # `pid_c * chunk_size * stride_dt_seqlen` was computed in 32-bit and
@@ -123,18 +123,23 @@ def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_no_overflow():
     assert torch.isfinite(ddt_bias).all()
 
 
-def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow():
+def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow() -> None:
     # Regression test for a distinct 32-bit pointer-arithmetic overflow in
     # the same two kernels as test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_no_overflow
     # above: `pid_b * stride_dt_batch` is a separate pointer-offset
     # multiplication from `pid_c * chunk_size * stride_dt_seqlen`, so casting
     # pid_c alone does not protect it. The test above always uses batch=1,
     # so pid_b is always 0 and this term is never exercised regardless of
-    # how large stride_dt_batch is -- this test uses batch=4 to cover it.
+    # how large stride_dt_batch is -- this test uses batch>1 to cover it.
     # stride_dt_batch is large exactly when dt is a non-contiguous slice of a
     # wide fused projection (e.g. transformers' NemotronHMamba2Mixer
-    # splitting a fused in_proj output across batch elements), matching a
-    # real reported crash: batch=4, seqlen=40_960, parent_width=35_072.
+    # splitting a fused in_proj output across batch elements); the original
+    # reported crash was batch=4, seqlen=40_960, parent_width=35_072, which
+    # requires allocating a ~10.7 GiB parent tensor and can OOM on GPUs with
+    # 8-12 GiB. The overflow trigger is (batch - 1) * seqlen * parent_width,
+    # so a larger batch needs a smaller seqlen/parent_width product to clear
+    # the same threshold -- batch=8 with a much narrower/shorter parent
+    # tensor still overflows with margin, at roughly half the memory.
     #
     # isfinite alone cannot reliably catch this (see the comparable
     # discussion for test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow):
@@ -142,13 +147,19 @@ def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow():
     # finite but silently wrong values. Compare against the same kernels run
     # on a contiguous copy of the identical values instead.
     device = 'cuda'
+    total_memory = torch.cuda.get_device_properties(device).total_memory
+    required_memory = 6 * 1024**3  # ~5 GiB parent tensor plus headroom for allocator overhead
+    if total_memory < required_memory:
+        pytest.skip(f"GPU has {total_memory / 1024**3:.1f} GiB, need >= {required_memory / 1024**3:.0f} GiB")
+
     torch.manual_seed(0)
-    batch = 4
-    seqlen = 40_960
+    batch = 8
+    seqlen = 8_192
     nheads = 128
     chunk_size = 128
-    parent_width = 35_072  # matches the real-world crash this guards against
+    parent_width = 40_960  # (batch - 1) * seqlen * parent_width > 2**31 - 1, with ~9% margin
     assert parent_width >= nheads
+    assert (batch - 1) * seqlen * parent_width > 2**31 - 1, "test parameters too small to overflow the batch-axis term"
 
     parent = torch.randn((batch, seqlen, parent_width), dtype=torch.bfloat16, device=device)
     dt = parent[:, :, -nheads:]
