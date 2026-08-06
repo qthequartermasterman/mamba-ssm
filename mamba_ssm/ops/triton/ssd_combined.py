@@ -604,22 +604,29 @@ def selective_scan_bwd(dout, x, dt, A, B, C, D=None, z=None):
     return ddt, dA
 
 
+def _coerce_contiguous_ssd_inputs(x, dt, B, C, z):
+    # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba. Factored out
+    # (rather than inlined in forward()) so tests can monkeypatch it to a
+    # no-op and confirm it's still needed given the kernels' own int64 fixes.
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not dt.is_contiguous():
+        dt = dt.contiguous()
+    if not B.is_contiguous():
+        B = B.contiguous()
+    if not C.is_contiguous():
+        C = C.contiguous()
+    if z is not None and not z.is_contiguous():
+        z = z.contiguous()
+    return x, dt, B, C, z
+
+
 class MambaChunkScanCombinedFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), return_final_states=False, return_varlen_states=False, state_dtype=None):
         ctx.dt_dtype = dt.dtype
-        # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
-        if not x.is_contiguous():
-            x = x.contiguous()
-        if not dt.is_contiguous():
-            dt = dt.contiguous()
-        if not B.is_contiguous():
-            B = B.contiguous()
-        if not C.is_contiguous():
-            C = C.contiguous()
-        if z is not None and not z.is_contiguous():
-            z = z.contiguous()
+        x, dt, B, C, z = _coerce_contiguous_ssd_inputs(x, dt, B, C, z)
         if not return_varlen_states:
             cu_seqlens = None
         else:
