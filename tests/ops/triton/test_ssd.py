@@ -12,6 +12,7 @@ from mamba_ssm.ops.triton.ssd_chunk_state import (
     chunk_state,
     chunk_state_varlen,
 )
+from mamba_ssm.ops.triton.ssd_bmm import _bmm_chunk_fwd, _bmm_chunk_bwd
 from mamba_ssm.ops.triton import ssd_combined
 from mamba_ssm.ops.triton.ssd_combined import (
     mamba_chunk_scan_combined,
@@ -182,6 +183,46 @@ def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow() -
     # float roundoff differences at the ~1e-3 level even for a correct kernel.
     torch.testing.assert_close(dA, dA_c, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(ddt_bias, ddt_bias_c, rtol=1e-3, atol=1e-3)
+
+
+def test_bmm_chunk_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow() -> None:
+    # _bmm_chunk_fwd_kernel/_bmm_chunk_bwd_kernel left `pid_b` uncast (only
+    # `pid_ch` was fixed), so `pid_b * stride_a_batch` overflows int32 at
+    # batch > 1 with a wide fused-projection stride -- unlike every other
+    # kernel in this codebase with an analogous batch term. See
+    # TODO: LinkToFutureIssueInMamba. Confirmed via direct reproduction: this
+    # crashes with an illegal memory access before the pid_b cast is added,
+    # not just wrong-but-finite values -- so isfinite() alone would actually
+    # catch this one, but compare against a contiguous copy anyway to also
+    # catch a wrapped-but-in-bounds offset if the margin were different.
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=6)
+
+    torch.manual_seed(0)
+    batch = 8
+    seqlen = 8_192
+    chunk_size = 128
+    ngroups = 1
+    dstate = 32
+    parent_width = 40_960  # (batch - 1) * seqlen * parent_width > 2**31 - 1, with ~9% margin
+
+    a, b = wide_noncontiguous_slices(device, seqlen, parent_width, [(ngroups, dstate), (ngroups, dstate)], batch=batch)
+    assert not a.is_contiguous()
+    assert a.stride(0) * (batch - 1) > 2**31 - 1, "test parameters too small to overflow the batch-axis term"
+    a_c, b_c = a.contiguous(), b.contiguous()
+
+    out = _bmm_chunk_fwd(a, b, chunk_size)
+    out_c = _bmm_chunk_fwd(a_c, b_c, chunk_size)
+    torch.cuda.synchronize(device)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.float(), out_c.float(), rtol=1e-4, atol=1e-4)
+
+    dout = torch.randn_like(out)
+    da = _bmm_chunk_bwd(a, dout)
+    da_c = _bmm_chunk_bwd(a_c, dout)
+    torch.cuda.synchronize(device)
+    assert torch.isfinite(da).all()
+    torch.testing.assert_close(da.float(), da_c.float(), rtol=1e-4, atol=1e-4)
 
 
 def test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow() -> None:
