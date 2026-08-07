@@ -631,6 +631,54 @@ def test_state_passing_fwd_bwd_noncontiguous_states_batch_axis_no_overflow() -> 
     torch.testing.assert_close(ddA, ddA_ref)
 
 
+def test_state_passing_fwd_bwd_noncontiguous_states_dim_axis_no_overflow() -> None:
+    # Third pid cast in the same kernels: `offs_m * stride_states_dim`,
+    # where offs_m is derived from pid_m = tl.program_id(axis=0) (the
+    # per-head state-dim block index), separate from the pid_b/pid_h terms
+    # above. See TODO: LinkToFutureIssueInMamba. `dim`'s own stride is 1 in
+    # production (states is freshly allocated, contiguous), so unlike
+    # batch/head this doesn't arise naturally -- reproduced directly here
+    # via a parent tensor padded on a *new* trailing axis (same technique
+    # as the dA_chunk_cumsum test), so dim's own size can stay small while
+    # its stride is large.
+    #
+    # Confirmed via direct reproduction before this fix: reverting pid_m's
+    # cast crashes with an illegal memory access at this exact scale, same
+    # as the pid_b/ssd_bmm cases -- this was not just a theoretical gap.
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=12)
+
+    torch.manual_seed(0)
+    batch = 1
+    nchunks = 1
+    nheads = 1
+    dim = 100_000
+    pad = 23_400  # (dim - 1) * pad > 2**31 - 1, with ~9% margin
+
+    parent = torch.randn(batch, nchunks, nheads, dim, pad, dtype=torch.bfloat16, device=device)
+    states = parent[:, :, :, :, 0]
+    assert not states.is_contiguous()
+    assert (dim - 1) * states.stride(3) > 2**31 - 1, "test parameters too small to overflow the dim-axis term"
+    states_c = states.contiguous()
+
+    dA_chunk_cumsum = torch.randn(batch, nheads, nchunks, dtype=torch.float32, device=device)
+    dout = torch.randn(batch, nchunks, nheads, dim, dtype=torch.float32, device=device)
+
+    out, final_states = _state_passing_fwd(states, dA_chunk_cumsum)
+    out_ref, final_states_ref = _state_passing_fwd(states_c, dA_chunk_cumsum)
+    torch.cuda.synchronize(device)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.float(), out_ref.float(), rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(final_states, final_states_ref)
+
+    dstates, ddA, _ = _state_passing_bwd(states, dA_chunk_cumsum, dout, has_initial_states=False)
+    dstates_ref, ddA_ref, _ = _state_passing_bwd(states_c, dA_chunk_cumsum, dout, has_initial_states=False)
+    torch.cuda.synchronize(device)
+    assert torch.isfinite(dstates).all()
+    torch.testing.assert_close(dstates.float(), dstates_ref.float(), rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(ddA, ddA_ref)
+
+
 def test_chunk_state_varlen_noncontiguous_wide_view_no_overflow() -> None:
     # Same overflow class in _chunk_state_varlen_kernel, see
     # TODO: LinkToFutureIssueInMamba. pid_c here comes from a loaded
