@@ -935,8 +935,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         C = rearrange(C, "b l (g n) -> b l g n", g=ctx.ngroups)
         dzxbcdt = torch.empty_like(zxbcdt)
         dzx0, dz, dxBC_given, ddt_given = torch.split(dzxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
-        # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
-        dxBC = torch.empty_like(xBC, memory_format=torch.contiguous_format)
+        dxBC = torch.empty_like(xBC)
         dx, dB, dC = torch.split(dxBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
         z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
         dx = rearrange(dx, "b l (h p) -> b l h p", h=nheads)
