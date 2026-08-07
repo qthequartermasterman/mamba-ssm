@@ -218,6 +218,23 @@ def test_chunk_scan_bwd_dz_torch_compile_matches_eager(device):
     assert_compile_matches_eager(_chunk_scan_bwd_dz, p["x"], p["z"], p["out_x"], p["dout"], p["chunk_size"])
 
 
+def test_chunk_scan_bwd_dz_with_d_torch_compile_matches_eager(device):
+    # build_pipeline's chunk_size=64 doesn't reliably exercise dD's autotune
+    # -- it needs BLOCK_SIZE_M candidates to actually differ in how many
+    # blocks they produce for a given chunk_size to trigger the same
+    # torch.compile/Inductor autotune-benchmark corruption seen in
+    # _chunk_scan_bwd_dcb. chunk_size=128 does.
+    torch.manual_seed(0)
+    batch, chunk_size, nheads, headdim = 2, 128, 4, 32
+    seqlen = 4 * chunk_size
+    x = torch.randn(batch, seqlen, nheads, headdim, device=device)
+    z = torch.randn(batch, seqlen, nheads, headdim, device=device)
+    out_x = torch.randn(batch, seqlen, nheads, headdim, device=device)
+    dout = torch.randn(batch, seqlen, nheads, headdim, device=device)
+    D = torch.randn(nheads, headdim, device=device)
+    assert_compile_matches_eager(_chunk_scan_bwd_dz, x, z, out_x, dout, chunk_size, D=D)
+
+
 def test_chunk_scan_bwd_dstates_torch_compile_matches_eager(device):
     p = build_pipeline(device)
     assert_compile_matches_eager(_chunk_scan_bwd_dstates, p["C"], p["dA_cumsum"], p["dout"])

@@ -337,10 +337,10 @@ def _chunk_scan_fwd_kernel_wip(
 
 @triton.autotune(
     configs=autotune_configs([
-        triton.Config({'BLOCK_SIZE_M': 32}),
-        triton.Config({'BLOCK_SIZE_M': 64}),
-        triton.Config({'BLOCK_SIZE_M': 128}),
-        triton.Config({'BLOCK_SIZE_M': 256}),
+        triton.Config({'BLOCK_SIZE_M': 32}, pre_hook=init_to_zero(["dD_ptr"])),
+        triton.Config({'BLOCK_SIZE_M': 64}, pre_hook=init_to_zero(["dD_ptr"])),
+        triton.Config({'BLOCK_SIZE_M': 128}, pre_hook=init_to_zero(["dD_ptr"])),
+        triton.Config({'BLOCK_SIZE_M': 256}, pre_hook=init_to_zero(["dD_ptr"])),
     ]),
     key=["chunk_size", "hdim"],
 )
