@@ -49,8 +49,8 @@ def _bmm_chunk_fwd_kernel(
     HAS_SEQ_IDX: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
 ):
-    pid_b = tl.program_id(axis=1)
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
+    pid_b = tl.program_id(axis=1).to(tl.int64)
     pid_ch = tl.program_id(axis=2).to(tl.int64)
     pid_c = pid_ch // ngroups
     pid_h = pid_ch - pid_c * ngroups
@@ -123,8 +123,8 @@ def _bmm_chunk_bwd_kernel(
     HAS_RESIDUAL: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_CS: tl.constexpr,
 ):
-    pid_b = tl.program_id(axis=1)
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
+    pid_b = tl.program_id(axis=1).to(tl.int64)
     pid_ch = tl.program_id(axis=2).to(tl.int64)
     pid_c = pid_ch // ngroups
     pid_h = pid_ch - pid_c * ngroups
