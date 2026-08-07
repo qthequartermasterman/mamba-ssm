@@ -1,8 +1,10 @@
 import math
 
-import pytest
 import torch
 import torch.nn.functional as F
+
+import pytest
+
 from einops import rearrange
 
 from mamba_ssm.ops.triton.ssd_chunk_state import (
@@ -12,6 +14,7 @@ from mamba_ssm.ops.triton.ssd_chunk_state import (
     chunk_state,
     chunk_state_varlen,
 )
+from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd, _state_passing_bwd
 from mamba_ssm.ops.triton.ssd_bmm import _bmm_chunk_fwd, _bmm_chunk_bwd
 from mamba_ssm.ops.triton import ssd_combined
 from mamba_ssm.ops.triton.ssd_combined import (
@@ -22,7 +25,6 @@ from mamba_ssm.ops.triton.ssd_combined import (
     ensure_stride,
     causal_conv1d_bwd_function,
 )
-from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd, _state_passing_bwd
 
 from overflow_test_utils import skip_if_insufficient_gpu_memory, wide_noncontiguous_slices
 
