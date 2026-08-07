@@ -229,13 +229,6 @@ def test_chunk_scan_bwd_dC_torch_compile_matches_eager(device):
                                  p["C"], p["ngroups"])
 
 
-@pytest.mark.skip(
-    reason="Known bug: torch.compile corrupts the ddA_cumsum value computed by "
-           "_chunk_scan_bwd_dcb_kernel (not just which block-tile slot gets summed -- "
-           "the per-slot value itself differs from eager, confirmed via direct kernel "
-           "invocation bypassing the Python wrapper). Re-enable once a real fix lands. "
-           "See TODO: LinkToFutureIssueInMamba."
-)
 def test_chunk_scan_bwd_dcb_torch_compile_matches_eager(device):
     p = build_pipeline(device)
     assert_compile_matches_eager(_chunk_scan_bwd_dcb, p["x"], p["dt_rounded"], p["dA_cumsum"], p["dout"],
