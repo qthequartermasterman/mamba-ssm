@@ -435,22 +435,16 @@ def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow() -> None:
         torch.testing.assert_close(g, g_ref, rtol=rtol, atol=atol, msg=f"{name} mismatch vs contiguous dout")
 
 
-def test_causal_conv1d_bwd_dx_given_old_approach_equivalent() -> None:
-    # MambaSplitConv1dScanCombinedFn.backward used to pass
+def test_causal_conv1d_bwd_dx_given_ensure_stride_copy_path() -> None:
+    # MambaSplitConv1dScanCombinedFn.backward passes
     # dx=rearrange(ensure_stride(dxBC_given), "b s d -> b d s") directly into
-    # causal_conv1d_bwd_function, then detect+repair any aliasing break via
-    # a stride-comparison-and-copy afterward (see git history, commit
-    # 5ed7fcc). The current code instead always passes dx=None and always
-    # copies explicitly.
-    #
-    # Empirically, both approaches agree with a ground-truth reference (an
-    # ordinary, unsliced dx) -- the old if/else already correctly detects
-    # and repairs the case where ensure_stride(dxBC_given) returns a *copy*
-    # (forced here via a monkeypatched impossible _UINT32_MAX, regardless
-    # of real scale). This looks like a safe simplification, not a
-    # correctness fix; unlike the four coercions removed elsewhere in this
-    # file, there is nothing to remove here since the old code path no
-    # longer exists -- this test just documents the equivalence.
+    # causal_conv1d_bwd_function, then detects+repairs any aliasing break via
+    # a stride-comparison-and-copy afterward. This exercises the repair path:
+    # force ensure_stride(dxBC_given) to return a copy (rather than a view)
+    # via a monkeypatched impossible _UINT32_MAX (not real overflow scale --
+    # see test_causal_conv1d_bwd_dx_given_wide_batch_stride_no_overflow for
+    # that), and confirm the if/else correctly detects and repairs it against
+    # a ground-truth reference (an ordinary, unsliced dx).
     device = 'cuda'
     torch.manual_seed(0)
 
@@ -480,37 +474,101 @@ def test_causal_conv1d_bwd_dx_given_old_approach_equivalent() -> None:
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(ssd_combined, "_UINT32_MAX", -1)  # force ensure_stride to always copy
 
-        # old approach
-        dxBC_given_old = make_wide_dx_given()
-        dx_in = rearrange(ensure_stride(dxBC_given_old), "b s d -> b d s")
-        assert dx_in.data_ptr() != dxBC_given_old.data_ptr(), "ensure_stride did not copy as expected"
+        dxBC_given = make_wide_dx_given()
+        dx_in = rearrange(ensure_stride(dxBC_given), "b s d -> b d s")
+        assert dx_in.data_ptr() != dxBC_given.data_ptr(), "ensure_stride did not copy as expected"
         dxBC_given_update, *_ = causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, dx_in, False, False)
         dxBC_given_update = rearrange(dxBC_given_update, "b d s -> b s d")
-        if dxBC_given_old.stride() != dxBC_given_update.stride():
-            dxBC_given_old.copy_(dxBC_given_update)
+        if dxBC_given.stride() != dxBC_given_update.stride():
+            dxBC_given.copy_(dxBC_given_update)
         else:
-            dxBC_given_old = dxBC_given_update
+            dxBC_given = dxBC_given_update
 
-        # new approach
-        dxBC_given_new = make_wide_dx_given()
-        dx_update, *_ = causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, None, False, False)
-        dx_update = rearrange(dx_update, "b d s -> b s d")
-        dxBC_given_new.copy_(dx_update)
+    torch.testing.assert_close(dxBC_given, dx_ref_bsd, msg="copy-path repair diverged from ground truth")
 
-    torch.testing.assert_close(dxBC_given_old, dx_ref_bsd, msg="old approach diverged from ground truth")
-    torch.testing.assert_close(dxBC_given_new, dx_ref_bsd, msg="new approach diverged from ground truth")
+
+def test_causal_conv1d_bwd_dx_given_wide_batch_stride_no_overflow() -> None:
+    # Real bug, not a hypothetical: dxBC_given is a slice of the wide dzxbcdt tensor,
+    # so it inherits dzxbcdt's batch stride. Passing it directly as the `dx` output
+    # buffer into causal_conv1d_bwd_function, with no protection at all, corrupts the
+    # result at genuine Nemotron scale (batch=4, seqlen=40960, in_proj width=35072)
+    # because (batch - 1) * seqlen * width exceeds 2**32 -- the batch-3 offset wraps
+    # into batch 0 inside the CUDA kernel. See TODO: LinkToFutureIssueInMamba.
+    #
+    # The actual code in MambaSplitConv1dScanCombinedFn.backward passes
+    # ensure_stride(dxBC_given) as `dx`, relying on ensure_stride's own overflow
+    # check to force a protective copy at this scale, then the stride-check-and-repair
+    # to copy that back into dxBC_given. This test proves that reliance is
+    # necessary -- not just a style choice -- by reproducing the corruption directly
+    # against two broken alternatives: passing dxBC_given as `dx` with no
+    # ensure_stride at all, and with ensure_stride but no copy-back repair.
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=25)
+    torch.manual_seed(0)
+
+    batch, seqlen, parent_width, channels, width = 4, 40960, 35072, 8, 4
+    assert (batch - 1) * seqlen * parent_width > 2**32 - 1
+
+    x_small = torch.randn(batch, seqlen, channels, device=device)
+    x = rearrange(ensure_stride(x_small), "b s d -> b d s")
+    weight = torch.randn(channels, width, device=device)
+    bias = torch.randn(channels, device=device)
+    dout_small = torch.randn(batch, seqlen, channels, device=device)
+    dout = rearrange(ensure_stride(dout_small), "b s d -> b d s")
+
+    dx_ref, *_ = causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, None, False, False)
+    dx_ref_bsd = rearrange(dx_ref, "b d s -> b s d").clone()
+
+    def make_wide_dx_given():
+        # non-contiguous slice of a much wider contiguous parent, matching
+        # dxBC_given's real construction as a slice of dzxbcdt.
+        parent = torch.zeros(batch, seqlen, parent_width, device=device)
+        given = parent[:, :, :channels]
+        assert not given.is_contiguous()
+        max_offset = sum((size - 1) * stride for size, stride in zip(given.shape, given.stride()))
+        assert max_offset > 2**32 - 1
+        return given
+
+    # Current code's approach: ensure_stride(dxBC_given) as dx, with the stride-check-and-repair.
+    dxBC_given_current = make_wide_dx_given()
+    dx_in_current = rearrange(ensure_stride(dxBC_given_current), "b s d -> b d s")
+    dxBC_given_update, *_ = causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, dx_in_current, False, False)
+    dxBC_given_update = rearrange(dxBC_given_update, "b d s -> b s d")
+    if dxBC_given_current.stride() != dxBC_given_update.stride():
+        dxBC_given_current.copy_(dxBC_given_update)
+    else:
+        dxBC_given_current = dxBC_given_update
+    torch.testing.assert_close(dxBC_given_current, dx_ref_bsd,
+                               msg="current code (ensure_stride(dxBC_given) as dx + repair) corrupted at genuine overflow scale")
+    del dxBC_given_current, dx_in_current, dxBC_given_update
+
+    # Naive alternative: dx=dxBC_given directly, no ensure_stride at all.
+    dxBC_given_naive = make_wide_dx_given()
+    dx_in_naive = rearrange(dxBC_given_naive, "b s d -> b d s")
+    causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, dx_in_naive, False, False)
+    assert (dxBC_given_naive - dx_ref_bsd).abs().max().item() > 1.0, \
+        "expected the naive dx=dxBC_given approach (no ensure_stride) to actually corrupt at this scale"
+    del dxBC_given_naive, dx_in_naive
+
+    # ensure_stride(dxBC_given) as dx, but no copy-back repair at all.
+    dxBC_given_no_repair = make_wide_dx_given()
+    dx_in_no_repair = rearrange(ensure_stride(dxBC_given_no_repair), "b s d -> b d s")
+    causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, dx_in_no_repair, False, False)
+    assert (dxBC_given_no_repair - dx_ref_bsd).abs().max().item() > 1.0, \
+        "expected ensure_stride(dxBC_given) as dx with no copy-back repair to actually corrupt at this scale"
 
 
 def test_mamba_split_conv1d_scan_combined_bwd_ensure_stride_copy_path() -> None:
     # The test above exercises ensure_stride's copy path against the bare
     # causal_conv1d_bwd_function primitive directly -- it never runs through
-    # MambaSplitConv1dScanCombinedFn.backward() itself (lines around
-    # dxBC_given.copy_(dxBC_given_update), see TODO: LinkToFutureIssueInMamba),
-    # so it doesn't prove that *that* code, as actually invoked by autograd,
-    # is unaffected by ensure_stride returning a copy instead of a view.
-    # Force the copy path (as above, via the same _UINT32_MAX monkeypatch --
-    # not real overflow scale) and compare gradients against an unpatched
-    # run of the exact same real backward path.
+    # MambaSplitConv1dScanCombinedFn.backward() itself (the dxBC_given
+    # stride-check-and-repair around causal_conv1d_bwd_function, see TODO:
+    # LinkToFutureIssueInMamba), so it doesn't prove that *that* code, as
+    # actually invoked by autograd, is unaffected by ensure_stride returning
+    # a copy instead of a view. Force the copy path (as above, via the same
+    # _UINT32_MAX monkeypatch -- not real overflow scale) and compare
+    # gradients against an unpatched run (the common case: ensure_stride
+    # passes dxBC_given straight through) of the exact same real backward path.
     device = 'cuda'
     torch.manual_seed(0)
     batch, nheads, headdim, ngroups, dstate, chunk_size, seqlen = 2, 4, 32, 2, 16, 64, 256

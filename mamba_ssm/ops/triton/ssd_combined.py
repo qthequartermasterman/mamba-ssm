@@ -976,12 +976,21 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             doutproj_weight, doutproj_bias = None, None
         dxBC_given_update, dweight, dbias, *_ = causal_conv1d_bwd_function(
             rearrange(ensure_stride(xBC), "b s d -> b d s"), conv1d_weight, conv1d_bias,
-            # avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
+            # dxBC_given is a slice of the wide dzxbcdt tensor, so it inherits dzxbcdt's
+            # batch stride -- at Nemotron's 40k context, batch index 3's offset exceeds
+            # 2**32 and would wrap into batch 0 inside the CUDA kernel if passed here
+            # unprotected. ensure_stride() catches that (forcing a small, safely-strided
+            # copy) and the stride check below detects and repairs it; the common case
+            # (no overflow) passes dxBC_given straight through, avoiding an extra
+            # allocation and copy. See TODO: LinkToFutureIssueInMamba.
             rearrange(ensure_stride(dxBC), "b s d -> b d s"), seq_idx, None, None,
-            None, False, ctx.activation in ["silu", "swish"]
+            rearrange(ensure_stride(dxBC_given), "b s d -> b d s"), False, ctx.activation in ["silu", "swish"]
         )
         dxBC_given_update = rearrange(dxBC_given_update, "b d s -> b s d")
-        dxBC_given.copy_(dxBC_given_update)
+        if dxBC_given.stride() != dxBC_given_update.stride():
+            dxBC_given.copy_(dxBC_given_update)
+        else:
+            dxBC_given = dxBC_given_update
         return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None, None
 
 
