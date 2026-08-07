@@ -659,13 +659,13 @@ def _chunk_state_varlen_kernel(
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
 ):
-    pid_b = tl.program_id(axis=1)
+    # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
+    pid_b = tl.program_id(axis=1).to(tl.int64)
     pid_h = tl.program_id(axis=2)
     num_pid_n = tl.cdiv(dstate, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
     end_idx = tl.load(cu_seqlens_ptr + pid_b + 1)
-    # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba
     pid_c = ((end_idx - 1) // chunk_size).to(tl.int64)
     b_ptr += pid_c * chunk_size * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
     x_ptr += pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head

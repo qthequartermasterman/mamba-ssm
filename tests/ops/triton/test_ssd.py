@@ -726,3 +726,72 @@ def test_chunk_state_varlen_noncontiguous_wide_view_no_overflow() -> None:
     assert out.shape == (1, nheads, headdim, dstate)
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out.float(), out_c.float(), rtol=1e-4, atol=1e-4)
+
+
+def test_chunk_state_varlen_batch_axis_no_overflow() -> None:
+    # Distinct overflow term in the same kernel: `pid_b * stride_states_batch`
+    # (states_ptr, the varlen output buffer), separate from the pid_c term
+    # above. See TODO: LinkToFutureIssueInMamba. Unlike every other
+    # batch-axis case in this file, `states` here is freshly allocated
+    # (ordinary contiguous) inside chunk_state_varlen() itself -- its batch
+    # stride is just nheads * headdim * dstate, its own natural size, not
+    # an injected wide stride. So this needs a genuinely large *batch*
+    # (many packed sequences), not a synthetic parent tensor -- a real
+    # continuous-batching / packed-sequence scenario with tens of thousands
+    # of sequences in one call, which is realistic at serving scale.
+    #
+    # batch is capped by CUDA's ~65535 grid-dim-Y limit (this kernel grids
+    # over (·, batch, nheads)), so batch alone can't reach 2**31 - 1; nheads
+    # * headdim * dstate has to make up the rest.
+    #
+    # Confirmed via direct reproduction before this fix: reverting pid_b's
+    # cast crashes with an illegal memory access at this exact scale.
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=8)
+
+    torch.manual_seed(0)
+    batch = 65_000
+    nheads, headdim, dstate, ngroups = 8, 64, 72, 8
+    chunk_size = 128
+    total_seqlen = batch  # one token per sequence -- keeps x/B/dt/dA_cumsum small
+
+    assert (batch - 1) * nheads * headdim * dstate > 2**31 - 1, \
+        "test parameters too small to overflow the batch-axis term"
+    assert batch < 65_535, "batch must stay under CUDA's grid-dim-Y limit"
+
+    cu_seqlens = torch.arange(0, batch + 1, device=device, dtype=torch.int32)
+    nchunks = math.ceil((total_seqlen - 1) / chunk_size) + 1
+    padded_len = nchunks * chunk_size
+
+    x = torch.randn(total_seqlen, nheads, headdim, dtype=torch.bfloat16, device=device)
+    B = torch.randn(total_seqlen, ngroups, dstate, dtype=torch.bfloat16, device=device)
+    dt = F.softplus(torch.randn(1, padded_len, nheads, device=device, dtype=torch.float32) - 4)
+    A = -0.1 * torch.rand(nheads, device=device)
+    dA_cumsum, dt_rounded = _chunk_cumsum_fwd(dt, A, chunk_size)
+    dA_cumsum, dt_rounded = dA_cumsum.squeeze(0), dt_rounded.squeeze(0)
+    x_pad = F.pad(x, (0, 0, 0, 0, 0, padded_len - total_seqlen))
+    B_pad = F.pad(B, (0, 0, 0, 0, 0, padded_len - total_seqlen))
+    chunk_states = _chunk_state_fwd(B_pad.unsqueeze(0), x_pad.unsqueeze(0), dt_rounded.unsqueeze(0),
+                                    dA_cumsum.unsqueeze(0)).squeeze(0)
+
+    states = chunk_state_varlen(B, x, dt_rounded, dA_cumsum, cu_seqlens, chunk_states)
+    torch.cuda.synchronize(device)
+    assert torch.isfinite(states).all()
+
+    # Reference: recompute a handful of sequences (first, last, and a
+    # couple in between) independently via the same chunk_state/
+    # _state_passing_fwd path the batched varlen kernel is meant to match --
+    # a full independent recompute for all 65,000 sequences would be slow
+    # and isn't necessary to catch a wrapped-but-in-bounds batch offset.
+    for b in [0, 1, batch // 2, batch - 2, batch - 1]:
+        start, end = cu_seqlens[b].item(), cu_seqlens[b + 1].item()
+        x_s = x[start:end].unsqueeze(0)
+        B_s = B[start:end].unsqueeze(0)
+        dt_s = dt[:, start:end]
+        dA_cumsum_s, dt_rounded_s = _chunk_cumsum_fwd(dt_s, A, chunk_size)
+        st = chunk_state(B_s, x_s, dt_rounded_s, dA_cumsum_s)
+        _, final_states = _state_passing_fwd(rearrange(st, "... p n -> ... (p n)"), dA_cumsum_s[:, :, :, -1],
+                                             chunk_size=chunk_size)
+        final_states = rearrange(final_states, "... (p n) -> ... p n", n=dstate).squeeze(0)
+        torch.testing.assert_close(states[b].float(), final_states.float(), rtol=1e-4, atol=1e-4,
+                                   msg=f"batch index {b} mismatch")
