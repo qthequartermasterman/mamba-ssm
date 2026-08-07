@@ -12,11 +12,14 @@ from mamba_ssm.ops.triton.ssd_chunk_state import (
     chunk_state,
     chunk_state_varlen,
 )
+from mamba_ssm.ops.triton import ssd_combined
 from mamba_ssm.ops.triton.ssd_combined import (
     mamba_chunk_scan_combined,
     mamba_split_conv1d_scan_combined,
     _mamba_chunk_scan_combined_fwd,
     _mamba_chunk_scan_combined_bwd,
+    ensure_stride,
+    causal_conv1d_bwd_function,
 )
 from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd, _state_passing_bwd
 
@@ -317,6 +320,72 @@ def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow() -> None:
         assert torch.isfinite(g).all(), f"{name} has non-finite values"
         rtol, atol = tols.get(name, (None, None))
         torch.testing.assert_close(g, g_ref, rtol=rtol, atol=atol, msg=f"{name} mismatch vs contiguous dout")
+
+
+def test_causal_conv1d_bwd_dx_given_old_approach_equivalent() -> None:
+    # MambaSplitConv1dScanCombinedFn.backward used to pass
+    # dx=rearrange(ensure_stride(dxBC_given), "b s d -> b d s") directly into
+    # causal_conv1d_bwd_function, then detect+repair any aliasing break via
+    # a stride-comparison-and-copy afterward (see git history, commit
+    # 5ed7fcc). The current code instead always passes dx=None and always
+    # copies explicitly.
+    #
+    # Empirically, both approaches agree with a ground-truth reference (an
+    # ordinary, unsliced dx) -- the old if/else already correctly detects
+    # and repairs the case where ensure_stride(dxBC_given) returns a *copy*
+    # (forced here via a monkeypatched impossible _UINT32_MAX, regardless
+    # of real scale). This looks like a safe simplification, not a
+    # correctness fix; unlike the four coercions removed elsewhere in this
+    # file, there is nothing to remove here since the old code path no
+    # longer exists -- this test just documents the equivalence.
+    device = 'cuda'
+    torch.manual_seed(0)
+
+    batch, dim, seqlen, width = 2, 16, 64, 4
+    # x/dout must be genuinely channels-last (via ensure_stride + rearrange),
+    # matching how the real code constructs them -- a plain contiguous x/dout
+    # is NOT representative and can make the kernel reject a channels-last dx
+    # for an unrelated reason (layout mismatch between x and dx).
+    xBC = torch.randn(batch, seqlen, dim, dtype=torch.float32, device=device)
+    x = rearrange(ensure_stride(xBC), "b s d -> b d s")
+    weight = torch.randn(dim, width, dtype=torch.float32, device=device)
+    bias = torch.randn(dim, dtype=torch.float32, device=device)
+    doutBC = torch.randn(batch, seqlen, dim, dtype=torch.float32, device=device)
+    dout = rearrange(ensure_stride(doutBC), "b s d -> b d s")
+
+    dx_ref, *_ = causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, None, False, False)
+    dx_ref_bsd = rearrange(dx_ref, "b d s -> b s d")
+
+    def make_wide_dx_given():
+        # non-contiguous slice of a wider contiguous parent, matching
+        # dxBC_given's real construction as a slice of dzxbcdt.
+        parent = torch.zeros(batch, seqlen, dim * 3, dtype=torch.float32, device=device)
+        given = parent[:, :, :dim]
+        assert not given.is_contiguous()
+        return given
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ssd_combined, "_UINT32_MAX", -1)  # force ensure_stride to always copy
+
+        # old approach
+        dxBC_given_old = make_wide_dx_given()
+        dx_in = rearrange(ensure_stride(dxBC_given_old), "b s d -> b d s")
+        assert dx_in.data_ptr() != dxBC_given_old.data_ptr(), "ensure_stride did not copy as expected"
+        dxBC_given_update, *_ = causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, dx_in, False, False)
+        dxBC_given_update = rearrange(dxBC_given_update, "b d s -> b s d")
+        if dxBC_given_old.stride() != dxBC_given_update.stride():
+            dxBC_given_old.copy_(dxBC_given_update)
+        else:
+            dxBC_given_old = dxBC_given_update
+
+        # new approach
+        dxBC_given_new = make_wide_dx_given()
+        dx_update, *_ = causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, None, False, False)
+        dx_update = rearrange(dx_update, "b d s -> b s d")
+        dxBC_given_new.copy_(dx_update)
+
+    torch.testing.assert_close(dxBC_given_old, dx_ref_bsd, msg="old approach diverged from ground truth")
+    torch.testing.assert_close(dxBC_given_new, dx_ref_bsd, msg="new approach diverged from ground truth")
 
 
 def test_mamba_split_conv1d_scan_combined_fwd_noncontiguous_no_overflow() -> None:
