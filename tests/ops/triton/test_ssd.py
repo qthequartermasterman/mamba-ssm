@@ -501,6 +501,49 @@ def test_causal_conv1d_bwd_dx_given_old_approach_equivalent() -> None:
     torch.testing.assert_close(dxBC_given_new, dx_ref_bsd, msg="new approach diverged from ground truth")
 
 
+def test_mamba_split_conv1d_scan_combined_bwd_ensure_stride_copy_path() -> None:
+    # The test above exercises ensure_stride's copy path against the bare
+    # causal_conv1d_bwd_function primitive directly -- it never runs through
+    # MambaSplitConv1dScanCombinedFn.backward() itself (lines around
+    # dxBC_given.copy_(dxBC_given_update), see TODO: LinkToFutureIssueInMamba),
+    # so it doesn't prove that *that* code, as actually invoked by autograd,
+    # is unaffected by ensure_stride returning a copy instead of a view.
+    # Force the copy path (as above, via the same _UINT32_MAX monkeypatch --
+    # not real overflow scale) and compare gradients against an unpatched
+    # run of the exact same real backward path.
+    device = 'cuda'
+    torch.manual_seed(0)
+    batch, nheads, headdim, ngroups, dstate, chunk_size, seqlen = 2, 4, 32, 2, 16, 64, 256
+    dim = nheads * headdim
+    width_conv1d = dim + 2 * ngroups * dstate
+    conv_width = 4
+
+    def run(force_copy):
+        torch.manual_seed(0)
+        zxbcdt = torch.randn(batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads,
+                             device=device, requires_grad=True)
+        conv1d_weight = torch.randn(width_conv1d, conv_width, device=device)
+        conv1d_bias = torch.randn(width_conv1d, device=device)
+        dt_bias = torch.randn(nheads, device=device)
+        A = -torch.rand(nheads, device=device) - 0.01
+        D = torch.randn(nheads, headdim, device=device)
+        with pytest.MonkeyPatch.context() as mp:
+            if force_copy:
+                mp.setattr(ssd_combined, "_UINT32_MAX", -1)
+            out = mamba_split_conv1d_scan_combined(
+                zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, ngroups=ngroups)
+            out.sum().backward()
+        torch.cuda.synchronize(device)
+        return out.detach().clone(), zxbcdt.grad.clone()
+
+    out_copy, grad_copy = run(force_copy=True)
+    out_view, grad_view = run(force_copy=False)
+
+    assert torch.isfinite(grad_copy).all()
+    torch.testing.assert_close(out_copy, out_view, msg="forward output changed by forcing ensure_stride's copy path")
+    torch.testing.assert_close(grad_copy, grad_view, msg="backward gradient changed by forcing ensure_stride's copy path")
+
+
 def test_mamba_split_conv1d_scan_combined_fwd_noncontiguous_no_overflow() -> None:
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
     # x/B/C are non-contiguous here not via an artificial wide-slice trick
