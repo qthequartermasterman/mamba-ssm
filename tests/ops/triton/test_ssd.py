@@ -778,6 +778,70 @@ def test_mamba_chunk_scan_combined_noncontiguous_wide_view_batch_axis_no_overflo
                                    msg=f"{name}.grad mismatch vs contiguous-equivalent")
 
 
+def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow_known_answer() -> None:
+    # Known-answer counterpart to the sibling test below, targeting the
+    # same wide, non-contiguous dout (the incoming gradient from autograd
+    # can arrive with an arbitrary, caller-controlled large stride, unlike
+    # x/dt/B/C which we control ourselves). A constant dout = 1 is exactly
+    # the adjoint of out.sum().backward() -- the operating point used by
+    # test_mamba_chunk_scan_combined_bwd_noncontiguous_wide_view_no_overflow_known_answer
+    # above -- so the same closed-form gradients apply here unchanged:
+    #   dC[t]  = nheads * headdim * (t + 1)
+    #   dB[t]  = nheads * headdim * (T - t)
+    #   dx[t]  = dstate * (T - t)
+    #   ddt[t] = headdim * dstate * (T - t)
+    #   dA     = headdim * dstate * (T + 1) * T * (T - 1) / 6
+    # D is set to 0 (not None) so dD gets returned rather than skipped --
+    # 0*x adds nothing to the forward output, so it doesn't disturb the
+    # formulas above, and dD = sum_t(dout * x) = T at this operating point.
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=6)
+
+    batch = 1
+    nheads = 16
+    headdim = 64
+    ngroups = 1
+    dstate = 32
+    chunk_size = 128
+    nchunks = 906
+    seqlen = nchunks * chunk_size
+    parent_width = 18_560
+
+    x = torch.ones(batch, seqlen, nheads, headdim, dtype=torch.float32, device=device)
+    B = torch.ones(batch, seqlen, ngroups, dstate, dtype=torch.float32, device=device)
+    C = torch.ones(batch, seqlen, ngroups, dstate, dtype=torch.float32, device=device)
+    dt = torch.ones(batch, seqlen, nheads, dtype=torch.float32, device=device)
+    A = torch.zeros(nheads, dtype=torch.float32, device=device)
+    D = torch.zeros(nheads, headdim, dtype=torch.float32, device=device)
+
+    out, *_ = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D)
+
+    dout_parent = torch.ones(batch, seqlen, parent_width, dtype=torch.float32, device=device)
+    dout = dout_parent[:, :, -nheads * headdim:].view(batch, seqlen, nheads, headdim)
+    assert not dout.is_contiguous()
+    assert (nchunks - 1) * chunk_size * dout.stride(1) > 2**31 - 1
+
+    dx, ddt, dA, dB, dC, dD, *_ = _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=D)
+    torch.cuda.synchronize(device)
+
+    T = seqlen
+    t = torch.arange(seqlen, dtype=torch.float32, device=device)
+    checks = [
+        ("dC", dC, (nheads * headdim * (t + 1))[None, :, None, None].expand(batch, seqlen, ngroups, dstate)),
+        ("dB", dB, (nheads * headdim * (T - t))[None, :, None, None].expand(batch, seqlen, ngroups, dstate)),
+        ("dx", dx, (dstate * (T - t))[None, :, None, None].expand(batch, seqlen, nheads, headdim)),
+        ("ddt", ddt, (headdim * dstate * (T - t))[None, :, None].expand(batch, seqlen, nheads)),
+        ("dA", dA, torch.full((nheads,), headdim * dstate * (T + 1) * T * (T - 1) / 6, device=device)),
+        ("dD", dD, torch.full((nheads, headdim), float(T), device=device)),
+    ]
+    for name, g, expected in checks:
+        assert torch.isfinite(g).all(), f"{name} has non-finite values"
+        # Same loose relative tolerance as the sibling fwd+bwd known-answer
+        # test above: float32 accumulation roundoff over ~900 chunks, not a
+        # sign of a real bug.
+        torch.testing.assert_close(g.float(), expected, rtol=1e-3, atol=0, msg=f"{name} mismatch")
+
+
 def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow() -> None:
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
     # dout is the incoming gradient from autograd, so unlike x/dt/B/C (all
