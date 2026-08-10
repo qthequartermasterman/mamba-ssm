@@ -623,6 +623,91 @@ def test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow() -> None
                                    msg=f"{name}.grad mismatch vs contiguous-equivalent")
 
 
+def test_mamba_chunk_scan_combined_noncontiguous_wide_view_batch_axis_no_overflow_known_answer() -> None:
+    # Batch-axis counterpart to the chunk-axis known-answer fwd+bwd tests
+    # above (combined into one test here, like the sibling test below,
+    # since batch=8/nchunks=64 is cheap enough not to need splitting).
+    #
+    # Same A=0, dt=1, D=None, z=None setup, but x = B = C = v[b] = b + 1
+    # (batch-dependent, not just 1) so a wrapped read landing on the wrong
+    # batch reads a different, distinguishable v. With decay=1:
+    #   state[t,p,n] = v[b]^2 * (t + 1)
+    #   out[t,p]     = dstate * v[b]^3 * (t + 1)
+    # Differentiating (ngroups=1, so B/C are shared across all nheads
+    # heads and pick up a factor of nheads; A is shared across all
+    # batches, so its gradient sums v[b]^3 over every batch):
+    #   dC[t,b]  = nheads * headdim * v[b]^2 * (t + 1)
+    #   dB[t,b]  = nheads * headdim * v[b]^2 * (T - t)
+    #   dx[t,b]  = dstate * v[b]^2 * (T - t)
+    #   ddt[t,b] = headdim * dstate * v[b]^3 * (T - t)
+    #   dA[h]    = headdim * dstate * (T + 1) * T * (T - 1) / 6 * sum_b(v[b]^3)
+    # Derived the same way as the chunk-axis version: general partial
+    # derivatives of the trilinear-in-(x,B,C) recurrence, then evaluated
+    # at x=B=C=v[b] instead of x=B=C=1 -- every term above is exactly the
+    # chunk-axis formula times the extra v[b]^2 or v[b]^3 its derivation
+    # picks up from the extra non-unit constant.
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=8)
+
+    batch = 8
+    nheads = 16
+    headdim = 64
+    ngroups = 1
+    dstate = 32
+    chunk_size = 128
+    nchunks = 64
+    seqlen = nchunks * chunk_size
+    parent_width = 40_960  # (batch - 1) * seqlen * parent_width > 2**31 - 1, with ~9% margin
+
+    parent = torch.zeros((batch, seqlen, parent_width), dtype=torch.float32, device=device)
+    offset = 0
+    x = parent[..., offset:offset + nheads * headdim].view(batch, seqlen, nheads, headdim)
+    offset += nheads * headdim
+    B = parent[..., offset:offset + ngroups * dstate].view(batch, seqlen, ngroups, dstate)
+    offset += ngroups * dstate
+    C = parent[..., offset:offset + ngroups * dstate].view(batch, seqlen, ngroups, dstate)
+    offset += ngroups * dstate
+    v = torch.arange(1, batch + 1, dtype=torch.float32, device=device)
+    x.copy_(v[:, None, None, None])
+    B.copy_(v[:, None, None, None])
+    C.copy_(v[:, None, None, None])
+    assert not x.is_contiguous()
+    assert not B.is_contiguous()
+    assert not C.is_contiguous()
+    assert (batch - 1) * x.stride(0) > 2**31 - 1, "test parameters too small to overflow the batch-axis term"
+
+    dt = torch.ones(batch, seqlen, nheads, dtype=torch.float32, device=device)
+    A = torch.zeros(nheads, dtype=torch.float32, device=device)
+    for tensor in (x, B, C, dt, A):
+        tensor.requires_grad_()
+
+    out = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size)
+    torch.cuda.synchronize(device)
+
+    assert out.shape == (batch, seqlen, nheads, headdim)
+    T = seqlen
+    t = torch.arange(seqlen, dtype=torch.float32, device=device)
+    expected_out = (dstate * v[:, None] ** 3 * (t + 1)[None, :])[:, :, None, None].expand(batch, seqlen, nheads, headdim)
+    torch.testing.assert_close(out, expected_out, rtol=1e-3, atol=0)
+
+    out.sum().backward()
+    torch.cuda.synchronize(device)
+
+    v2, v3 = v**2, v**3
+    for name, grad, expected in [
+        ("C", C.grad, (nheads * headdim * v2[:, None] * (t + 1)[None, :])[:, :, None, None].expand(batch, seqlen, ngroups, dstate)),
+        ("B", B.grad, (nheads * headdim * v2[:, None] * (T - t)[None, :])[:, :, None, None].expand(batch, seqlen, ngroups, dstate)),
+        ("x", x.grad, (dstate * v2[:, None] * (T - t)[None, :])[:, :, None, None].expand(batch, seqlen, nheads, headdim)),
+        ("dt", dt.grad, (headdim * dstate * v3[:, None] * (T - t)[None, :])[:, :, None].expand(batch, seqlen, nheads)),
+        ("A", A.grad, torch.full((nheads,), headdim * dstate * (T + 1) * T * (T - 1) / 6 * v3.sum().item(), device=device)),
+    ]:
+        assert grad is not None, f"{name}.grad is None"
+        # Same loose relative tolerance as the chunk-axis version: float32
+        # accumulation roundoff over many chunks/timesteps, not a sign of a
+        # real bug.
+        torch.testing.assert_close(grad.float(), expected, rtol=1e-3, atol=0, msg=f"{name}.grad mismatch")
+
+
 def test_mamba_chunk_scan_combined_noncontiguous_wide_view_batch_axis_no_overflow() -> None:
     # Batch-axis counterpart to test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow
     # above: `pid_b * stride_x_batch` (and the analogous B/C/z terms) in
