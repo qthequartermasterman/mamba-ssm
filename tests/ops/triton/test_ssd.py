@@ -1438,6 +1438,63 @@ def test_state_passing_fwd_bwd_noncontiguous_states_dim_axis_no_overflow() -> No
     torch.testing.assert_close(ddA, ddA_ref)
 
 
+def test_chunk_state_varlen_noncontiguous_wide_view_no_overflow_known_answer() -> None:
+    # Known-answer counterpart to the sibling test below. chunk_state_varlen
+    # recombines the inter-chunk chunk_states with an intra-chunk running
+    # sum up to a per-sequence end_idx loaded from cu_seqlens -- the same
+    # underlying recurrence as mamba_chunk_scan_combined's state (see its
+    # known-answer test above), just returning the raw final SSM state
+    # instead of a C-projected output. With A = 0 (no decay), dt = 1,
+    # x = B = 1: the state at the end of a sequence of length L is exactly
+    # L (every head/headdim/dstate position accumulates the same running
+    # count). Here cu_seqlens = [0, total_seqlen] (one sequence spanning
+    # the whole call), so out[0, h, p, n] = total_seqlen exactly --
+    # a wrong end_idx (from a misaddressed cu_seqlens load) would give some
+    # other, wrong count instead, still exact and still distinguishable.
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=6)
+
+    nheads = 8
+    headdim = 64
+    ngroups = 1
+    dstate = 32
+    chunk_size = 128
+    nchunks = 906  # (nchunks - 1) * chunk_size * 18_560 > 2**31 - 1
+    total_seqlen = nchunks * chunk_size
+    cu_seqlens = torch.tensor([0, total_seqlen], device=device, dtype=torch.int32)
+    parent_width = 18_560
+
+    parent = torch.zeros(total_seqlen, parent_width, dtype=torch.float32, device=device)
+    x = parent[:, :nheads * headdim].view(total_seqlen, nheads, headdim)
+    B = parent[:, nheads * headdim:nheads * headdim + ngroups * dstate].view(total_seqlen, ngroups, dstate)
+    x.fill_(1.0)
+    B.fill_(1.0)
+    assert not x.is_contiguous()
+    assert not B.is_contiguous()
+    assert (nchunks - 1) * chunk_size * x.stride(0) > 2**31 - 1
+
+    dt = torch.ones(total_seqlen, nheads, dtype=torch.float32, device=device)
+    A = torch.zeros(nheads, device=device)
+    dA_cumsum, dt_rounded = _chunk_cumsum_fwd(dt.unsqueeze(0), A, chunk_size)
+    chunk_states = _chunk_state_fwd(B.unsqueeze(0), x.unsqueeze(0), dt_rounded, dA_cumsum)
+    # chunk_state_varlen expects chunk_states to be the cross-chunk running
+    # state ENTERING each chunk, not _chunk_state_fwd's raw intra-chunk
+    # contribution -- _state_passing_fwd does that propagation (same as the
+    # parametrized test_chunk_state_varlen above).
+    chunk_states, _ = _state_passing_fwd(rearrange(chunk_states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1],
+                                         chunk_size=chunk_size)
+    chunk_states = rearrange(chunk_states, "... (p n) -> ... p n", n=dstate)
+    dA_cumsum, dt_rounded = dA_cumsum.squeeze(0), dt_rounded.squeeze(0)
+    chunk_states = chunk_states.squeeze(0)
+
+    out = chunk_state_varlen(B, x, dt_rounded, dA_cumsum, cu_seqlens, chunk_states)
+    torch.cuda.synchronize(device)
+
+    assert out.shape == (1, nheads, headdim, dstate)
+    expected_out = torch.full_like(out, float(total_seqlen))
+    torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+
+
 def test_chunk_state_varlen_noncontiguous_wide_view_no_overflow() -> None:
     # Same overflow class in _chunk_state_varlen_kernel, see
     # TODO: LinkToFutureIssueInMamba. pid_c here comes from a loaded
