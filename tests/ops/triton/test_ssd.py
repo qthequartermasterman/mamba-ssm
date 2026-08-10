@@ -105,6 +105,7 @@ def test_chunk_cumsum_fwd_noncontiguous_wide_view_no_overflow_known_answer() -> 
     # every (h, k) has a distinct expected value, so a misaddressed read
     # is caught even if it lands in-bounds.
     device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=9)
     seqlen = 115_866
     nheads = 128
     chunk_size = 128
@@ -207,7 +208,7 @@ def test_chunk_cumsum_fwd_noncontiguous_wide_view_batch_axis_no_overflow_known_a
     # value offset by a distinguishable multiple of BATCH_OFFSET rather
     # than one that could coincidentally match.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=6)
+    skip_if_insufficient_gpu_memory(device, required_gib=11)
 
     batch = 8
     seqlen = 8_192
@@ -320,7 +321,7 @@ def test_bmm_chunk_fwd_noncontiguous_wide_view_batch_axis_no_overflow_known_answ
     # linear in dout, so this holds for ANY dout (no need to also make
     # dout a known constant).
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=6)
+    skip_if_insufficient_gpu_memory(device, required_gib=11)
 
     batch = 8
     seqlen = 8_192
@@ -647,7 +648,7 @@ def test_mamba_chunk_scan_combined_noncontiguous_wide_view_batch_axis_no_overflo
     # chunk-axis formula times the extra v[b]^2 or v[b]^3 its derivation
     # picks up from the extra non-unit constant.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=8)
+    skip_if_insufficient_gpu_memory(device, required_gib=12)
 
     batch = 8
     nheads = 16
@@ -795,7 +796,7 @@ def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow_known_answ
     # 0*x adds nothing to the forward output, so it doesn't disturb the
     # formulas above, and dD = sum_t(dout * x) = T at this operating point.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=6)
+    skip_if_insufficient_gpu_memory(device, required_gib=12)
 
     batch = 1
     nheads = 16
@@ -1084,7 +1085,7 @@ def test_mamba_split_conv1d_scan_combined_fwd_noncontiguous_no_overflow_known_an
     # constant z_const gates the whole thing by a known F.silu(z_const):
     #   out[t] = out_x[t] * F.silu(z_const)
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=25)
+    skip_if_insufficient_gpu_memory(device, required_gib=26)
 
     batch = 1
     nheads = 289
@@ -1530,7 +1531,7 @@ def test_chunk_state_varlen_noncontiguous_wide_view_no_overflow_known_answer() -
     # a wrong end_idx (from a misaddressed cu_seqlens load) would give some
     # other, wrong count instead, still exact and still distinguishable.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=6)
+    skip_if_insufficient_gpu_memory(device, required_gib=9)
 
     nheads = 8
     headdim = 64
@@ -1638,8 +1639,12 @@ def test_chunk_state_varlen_batch_axis_no_overflow_known_answer() -> None:
     # packed stream, which for one-token sequences is exactly its batch
     # index b) makes states[b] = b + 1 exactly -- distinct per batch, so a
     # wrapped store landing in the wrong batch slot is caught.
+    #
+    # Measured peak usage is ~45.5 GiB (x/B in float32 at this batch size
+    # dominate) -- close to the limit of a 48 GiB GPU, so this margin is
+    # necessarily tight; it'll skip outright on anything smaller.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=8)
+    skip_if_insufficient_gpu_memory(device, required_gib=46)
 
     batch = 65_000
     nheads, headdim, dstate, ngroups = 8, 64, 72, 8
