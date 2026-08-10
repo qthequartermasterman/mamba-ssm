@@ -1107,6 +1107,87 @@ def test_mamba_split_conv1d_scan_combined_fwd_noncontiguous_no_overflow() -> Non
         assert torch.isfinite(out).all()
 
 
+def test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow_known_answer() -> None:
+    # Known-answer counterpart to the sibling test below, same wide,
+    # non-contiguous dA_chunk_cumsum setup. The fwd kernel implements
+    # y[0] = 0 (no initial_states); y[j+1] = exp(dA_chunk_cumsum[c]) * y[j] + states[c],
+    # out[j] = y[j] for j = 0..nchunks-1, final_states = y[nchunks].
+    #
+    # Setting states = 1 (constant) and dA_chunk_cumsum[h, c] = a[h] (a
+    # per-head constant, same for every c -- so a wrong-head read is
+    # distinguishable, unlike a shared constant) makes this a plain
+    # geometric series with ratio r[h] = exp(a[h]):
+    #   out[j, h] = S_h(j) := (1 - r[h]**j) / (1 - r[h])   (sum_{k=0}^{j-1} r[h]**k)
+    #   final_states[h] = S_h(nchunks)
+    # a[h] is kept negative (r[h] < 1) so the series stays bounded over
+    # nchunks steps instead of exploding.
+    #
+    # For backward, _state_passing_bwd's "states" argument is documented as
+    # the forward's own running-sum output (see StatePassingFn.backward,
+    # which passes `out`, not the raw per-chunk `states` input) -- so this
+    # test does the same, unlike the sibling test below (which just needs
+    # *some* same-shape tensor for a self-consistency check and reuses the
+    # raw `states` input for convenience). With dout = 1 (adjoint of
+    # out.sum()), the standard backward-recursion adjoint G_j = dout[j] +
+    # r[h]*G_{j+1} (G_nchunks = 0, no dfinal_states) solves to
+    # G_j = S_h(nchunks - j), giving:
+    #   dstates[c, h] = G_{c+1} = S_h(nchunks - c - 1)
+    #   ddA[c, h]     = dim * G_{c+1} * r[h] * y_c = dim * S_h(nchunks - c - 1) * r[h] * S_h(c)
+    #                   (the extra `dim` factor is _state_passing_bwd summing
+    #                   out[p]*dstates[p]*scale over the dim axis, which is
+    #                   constant across p here since out/dstates are)
+    # Verified by hand against a small (nchunks=4) case, cross-checked
+    # against torch.autograd through the real StatePassingFn, before
+    # committing to this closed form.
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=12)
+
+    batch = 1
+    nheads = 128
+    nchunks = 64
+    dim = 64
+    width = 300_000  # padding only, not a real chunk_size
+
+    parent = torch.zeros(batch, nheads, nchunks, width, dtype=torch.float32, device=device)
+    dA_chunk_cumsum = parent[:, :, :, -1]
+    a = -(torch.arange(1, nheads + 1, dtype=torch.float32, device=device)) * 0.01
+    dA_chunk_cumsum.copy_(a[None, :, None])
+    assert not dA_chunk_cumsum.is_contiguous()
+    assert (nheads - 1) * dA_chunk_cumsum.stride(1) > 2**31 - 1
+
+    states = torch.ones(batch, nchunks, nheads, dim, dtype=torch.float32, device=device)
+
+    out, final_states = _state_passing_fwd(states, dA_chunk_cumsum)
+    torch.cuda.synchronize(device)
+
+    r = torch.exp(a)  # (nheads,)
+
+    def S(n):
+        return (1 - r ** n) / (1 - r)
+
+    j = torch.arange(nchunks, dtype=torch.float32, device=device)
+    S_j = S(j[:, None])  # (nchunks, nheads), matches out's (chunk, head) axis order
+    expected_out = S_j[None, :, :, None].expand(batch, nchunks, nheads, dim)
+    torch.testing.assert_close(out, expected_out, rtol=1e-3, atol=0)
+    expected_final_states = S(torch.tensor(float(nchunks), device=device))[None, :, None].expand(batch, nheads, dim)
+    torch.testing.assert_close(final_states, expected_final_states, rtol=1e-3, atol=0)
+
+    dout = torch.ones(batch, nchunks, nheads, dim, dtype=torch.float32, device=device)
+    dstates, ddA, _ = _state_passing_bwd(out, dA_chunk_cumsum, dout, has_initial_states=False)
+    torch.cuda.synchronize(device)
+
+    c = torch.arange(nchunks, dtype=torch.float32, device=device)
+    G_next = S((nchunks - c - 1)[:, None])  # (nchunks, nheads): G_{c+1} for each chunk c
+    expected_dstates = G_next[None, :, :, None].expand(batch, nchunks, nheads, dim)
+    torch.testing.assert_close(dstates, expected_dstates, rtol=1e-3, atol=0)
+    # ddA sums out[p]*dstates[p]*scale over the full dim axis inside the
+    # kernel; out and dstates are both constant across dim here, so that
+    # sum is just dim * (the scalar formula).
+    expected_ddA_jh = dim * G_next * r[None, :] * S_j  # (nchunks, nheads): G_{c+1} * r[h] * S_h(c)
+    expected_ddA = expected_ddA_jh.transpose(0, 1)[None, :, :].expand(batch, nheads, nchunks)
+    torch.testing.assert_close(ddA, expected_ddA, rtol=1e-3, atol=0)
+
+
 def test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow() -> None:
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
     # dA_chunk_cumsum is *always* non-contiguous in production
