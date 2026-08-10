@@ -1230,6 +1230,72 @@ def test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow() -> No
     torch.testing.assert_close(ddA, ddA_ref)
 
 
+def test_state_passing_fwd_bwd_noncontiguous_states_batch_axis_no_overflow_known_answer() -> None:
+    # Batch-axis counterpart to the dA_chunk_cumsum known-answer test above,
+    # targeting `pid_b * stride_states_batch` instead. `states` (the
+    # per-chunk increment s_c) is what needs to be wide/batch-addressed
+    # here, so it -- not dA_chunk_cumsum -- carries the batch-distinguishing
+    # value: states[b, c] = v[b] = b + 1 (constant across c), decay
+    # dA_chunk_cumsum[b] = a[b] = -(b + 1) * 0.05 (also batch-distinct, for
+    # extra rigor, though not itself the tensor under test here).
+    #
+    # This just rescales the same geometric-series formulas from above by
+    # v[b] (since the recurrence is linear in s_c, and dstates doesn't
+    # depend on the states' own values, only on the decay and dout):
+    #   out[j, b]        = v[b] * S_b(j)
+    #   final_states[b]  = v[b] * S_b(nchunks)
+    #   dstates[c, b]    = S_b(nchunks - c - 1)                (unscaled)
+    #   ddA[c, b]        = S_b(nchunks - c - 1) * r[b] * v[b] * S_b(c)
+    # nheads = dim = 1 here (matching the sibling test's minimal shape), so
+    # there's no extra dim-summation factor this time.
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=12)
+
+    batch = 8
+    nchunks = 2
+    nheads = 1
+    dim = 1
+    width = 335_000_000  # (batch - 1) * width > 2**31 - 1, with ~9% margin
+
+    parent = torch.zeros(batch, width, dtype=torch.float32, device=device)
+    states = parent[:, :nchunks * nheads * dim].view(batch, nchunks, nheads, dim)
+    v = torch.arange(1, batch + 1, dtype=torch.float32, device=device)
+    states.copy_(v[:, None, None, None])
+    assert not states.is_contiguous()
+    assert (batch - 1) * states.stride(0) > 2**31 - 1, "test parameters too small to overflow the batch-axis term"
+
+    a = -(torch.arange(1, batch + 1, dtype=torch.float32, device=device)) * 0.05
+    dA_chunk_cumsum = a[:, None, None].expand(batch, nheads, nchunks).contiguous()
+
+    out, final_states = _state_passing_fwd(states, dA_chunk_cumsum)
+    torch.cuda.synchronize(device)
+
+    r = torch.exp(a)  # (batch,)
+
+    def S(n):
+        return (1 - r ** n) / (1 - r)
+
+    j = torch.arange(nchunks, dtype=torch.float32, device=device)
+    S_j = S(j[:, None])  # (nchunks, batch)
+    vs_j = (v[None, :] * S_j).transpose(0, 1)  # (batch, nchunks)
+    expected_out = vs_j[:, :, None, None].expand(batch, nchunks, nheads, dim)
+    torch.testing.assert_close(out, expected_out, rtol=1e-4, atol=0)
+    expected_final_states = (v * S(torch.tensor(float(nchunks), device=device)))[:, None, None].expand(batch, nheads, dim)
+    torch.testing.assert_close(final_states, expected_final_states, rtol=1e-4, atol=0)
+
+    dout = torch.ones(batch, nchunks, nheads, dim, dtype=torch.float32, device=device)
+    dstates, ddA, _ = _state_passing_bwd(out, dA_chunk_cumsum, dout, has_initial_states=False)
+    torch.cuda.synchronize(device)
+
+    c = torch.arange(nchunks, dtype=torch.float32, device=device)
+    G_next = S((nchunks - c - 1)[:, None])  # (nchunks, batch)
+    expected_dstates = G_next.transpose(0, 1)[:, :, None, None].expand(batch, nchunks, nheads, dim)
+    torch.testing.assert_close(dstates, expected_dstates, rtol=1e-4, atol=0)
+    expected_ddA_jb = G_next * r[None, :] * v[None, :] * S_j  # (nchunks, batch)
+    expected_ddA = expected_ddA_jb.transpose(0, 1)[:, None, :].expand(batch, nheads, nchunks)
+    torch.testing.assert_close(ddA, expected_ddA, rtol=1e-4, atol=0)
+
+
 def test_state_passing_fwd_bwd_noncontiguous_states_batch_axis_no_overflow() -> None:
     # Batch-axis counterpart to test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow
     # above: same pid_bc = tl.program_id(...).to(tl.int64) pattern, but for
