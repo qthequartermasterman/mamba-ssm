@@ -303,6 +303,62 @@ def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow() -
     torch.testing.assert_close(ddt_bias, ddt_bias_c, rtol=1e-3, atol=1e-3)
 
 
+def test_bmm_chunk_fwd_noncontiguous_wide_view_batch_axis_no_overflow_known_answer() -> None:
+    # Batch-axis counterpart to the chunk_cumsum known-answer tests above,
+    # targeting _bmm_chunk_fwd_kernel/_bmm_chunk_bwd_kernel's `pid_b`
+    # instead. Give a and b the same constant-per-batch vector value
+    # (batch_val = b + 1, repeated across seqlen/group/dstate) so
+    # out[b, c, h, m, n] = dstate * batch_val[b]**2 exactly, independent of
+    # m, n, c, h -- a wrapped read landing on the wrong batch reads a
+    # different, distinguishable batch_val.
+    #
+    # For the backward pass, _bmm_chunk_bwd(a, dout) computes the gradient
+    # for the OTHER matrix from forward (out = a @ b^T), i.e.
+    # da[b, n, k] = sum_m(dout[b, ..., m, n]) * a[b, m, k] -- and since a is
+    # fixed to the same constant-per-batch vector for every m,
+    # da[b, s, h, k] = batch_val[b] * sum_m(dout[b, ..., m]) for every k --
+    # linear in dout, so this holds for ANY dout (no need to also make
+    # dout a known constant).
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=6)
+
+    batch = 8
+    seqlen = 8_192
+    chunk_size = 128
+    ngroups = 1
+    dstate = 32
+    parent_width = 40_960  # (batch - 1) * seqlen * parent_width > 2**31 - 1, with ~9% margin
+    assert seqlen % chunk_size == 0, "test assumes a whole number of chunks (no padding term below)"
+    nchunks = seqlen // chunk_size
+
+    parent = torch.zeros((batch, seqlen, parent_width), dtype=torch.float32, device=device)
+    a = parent[..., :dstate].view(batch, seqlen, ngroups, dstate)
+    b = parent[..., dstate:2 * dstate].view(batch, seqlen, ngroups, dstate)
+    batch_val = torch.arange(1, batch + 1, dtype=torch.float32, device=device)
+    a.copy_(batch_val[:, None, None, None])
+    b.copy_(batch_val[:, None, None, None])
+    assert not a.is_contiguous()
+    assert a.stride(0) * (batch - 1) > 2**31 - 1, "test parameters too small to overflow the batch-axis term"
+
+    out = _bmm_chunk_fwd(a, b, chunk_size)
+    torch.cuda.synchronize(device)
+    expected_out = (dstate * batch_val**2)[:, None, None, None, None].expand(batch, nchunks, ngroups, chunk_size, chunk_size)
+    torch.testing.assert_close(out.float(), expected_out, rtol=1e-4, atol=1e-4)
+
+    dout = torch.randn(batch, nchunks, ngroups, chunk_size, chunk_size, device=device)
+    da = _bmm_chunk_bwd(a, dout)
+    torch.cuda.synchronize(device)
+    col_sum = dout.sum(dim=-2)  # (batch, nchunks, ngroups, chunk_size), one value per sequence position n
+    expected_da = (batch_val[:, None, None, None] * col_sum).reshape(batch, seqlen, ngroups)[..., None].expand(batch, seqlen, ngroups, dstate)
+    # Looser, mostly-absolute tolerance: summing chunk_size=128 random terms
+    # in blocks (kernel) vs. one shot (torch) causes float roundoff up to
+    # ~0.1 in absolute terms even for a correct kernel -- and relative error
+    # blows up whenever the true sum happens to land near 0 by cancellation,
+    # so atol has to carry most of the budget here, same idea as the dA
+    # comparison above (which doesn't hit this since dA is never near 0).
+    torch.testing.assert_close(da.float(), expected_da, rtol=1e-2, atol=0.2)
+
+
 def test_bmm_chunk_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow() -> None:
     # _bmm_chunk_fwd_kernel/_bmm_chunk_bwd_kernel left `pid_b` uncast (only
     # `pid_ch` was fixed), so `pid_b * stride_a_batch` overflows int32 at
