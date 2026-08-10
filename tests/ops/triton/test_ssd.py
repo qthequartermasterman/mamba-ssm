@@ -1544,6 +1544,58 @@ def test_chunk_state_varlen_noncontiguous_wide_view_no_overflow() -> None:
     torch.testing.assert_close(out.float(), out_c.float(), rtol=1e-4, atol=1e-4)
 
 
+def test_chunk_state_varlen_batch_axis_no_overflow_known_answer() -> None:
+    # Known-answer counterpart to the sibling test below, targeting the
+    # same `pid_b * stride_states_batch` term. Every sequence here is
+    # exactly one token, so it's always fully contained within a single
+    # global chunk -- the kernel's "if start_idx < pid_c * chunk_size:
+    # add chunk_states" branch (the cross-CHUNK carry) never fires, and its
+    # start_idx_cur masking excludes every other token packed into the same
+    # chunk. So states[b] reduces to exactly that one token's own
+    # contribution: dt[b] * x[b] * B[b], with no decay term (a single
+    # token's own last-step scale is exp(dA_cs_last - dA_cs_last) = 1
+    # regardless of A) and no cross-sequence leakage from chunk_states.
+    #
+    # Setting x = B = 1 and dt[i] = i + 1 (i = the token's position in the
+    # packed stream, which for one-token sequences is exactly its batch
+    # index b) makes states[b] = b + 1 exactly -- distinct per batch, so a
+    # wrapped store landing in the wrong batch slot is caught.
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=8)
+
+    batch = 65_000
+    nheads, headdim, dstate, ngroups = 8, 64, 72, 8
+    chunk_size = 128
+    total_seqlen = batch  # one token per sequence
+
+    assert (batch - 1) * nheads * headdim * dstate > 2**31 - 1, \
+        "test parameters too small to overflow the batch-axis term"
+    assert batch < 65_535, "batch must stay under CUDA's grid-dim-Y limit"
+
+    cu_seqlens = torch.arange(0, batch + 1, device=device, dtype=torch.int32)
+    nchunks = math.ceil((total_seqlen - 1) / chunk_size) + 1
+    padded_len = nchunks * chunk_size
+
+    x = torch.ones(total_seqlen, nheads, headdim, dtype=torch.float32, device=device)
+    B = torch.ones(total_seqlen, ngroups, dstate, dtype=torch.float32, device=device)
+    i = torch.arange(padded_len, dtype=torch.float32, device=device)
+    dt = (i + 1)[None, :, None].expand(1, padded_len, nheads).contiguous()
+    A = torch.zeros(nheads, device=device)
+    dA_cumsum, dt_rounded = _chunk_cumsum_fwd(dt, A, chunk_size)
+    dA_cumsum, dt_rounded = dA_cumsum.squeeze(0), dt_rounded.squeeze(0)
+    x_pad = F.pad(x, (0, 0, 0, 0, 0, padded_len - total_seqlen))
+    B_pad = F.pad(B, (0, 0, 0, 0, 0, padded_len - total_seqlen))
+    chunk_states = _chunk_state_fwd(B_pad.unsqueeze(0), x_pad.unsqueeze(0), dt_rounded.unsqueeze(0),
+                                    dA_cumsum.unsqueeze(0)).squeeze(0)
+
+    states = chunk_state_varlen(B, x, dt_rounded, dA_cumsum, cu_seqlens, chunk_states)
+    torch.cuda.synchronize(device)
+
+    b = torch.arange(batch, dtype=torch.float32, device=device)
+    expected_states = (b + 1)[:, None, None, None].expand(batch, nheads, headdim, dstate)
+    torch.testing.assert_close(states.float(), expected_states, rtol=1e-3, atol=0)
+
+
 def test_chunk_state_varlen_batch_axis_no_overflow() -> None:
     # Distinct overflow term in the same kernel: `pid_b * stride_states_batch`
     # (states_ptr, the varlen output buffer), separate from the pid_c term
