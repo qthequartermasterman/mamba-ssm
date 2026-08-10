@@ -90,10 +90,66 @@ def test_chunk_state_varlen(chunk_size, ngroups, dtype):
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
+def test_chunk_cumsum_fwd_noncontiguous_wide_view_no_overflow_known_answer() -> None:
+    # Same overflow as test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_no_overflow
+    # below, but instead of comparing against a second (contiguous) kernel
+    # run, use inputs where the correct output is known in closed form.
+    # With dt_softplus=False, no bias, and the default dt_limit=(0, inf),
+    # _chunk_cumsum_fwd reduces to: dt_out = dt, dA_cumsum[..., k] =
+    # A[h] * cumsum_k(dt). A constant dt (e.g. all 1s) is a weak check: a
+    # wrapped-but-in-bounds read landing on the wrong (h, k) would still
+    # dereference the same constant value by chance and go undetected.
+    # Instead, set dt to the within-chunk position j = 0..chunk_size-1
+    # (repeating every chunk), so dt_out[..., k] = k and
+    # dA_cumsum[b, h, c, k] = A[h] * sum_{j=0}^{k} j = A[h] * k * (k+1) / 2 --
+    # every (h, k) has a distinct expected value, so a misaddressed read
+    # is caught even if it lands in-bounds.
+    device = 'cuda'
+    seqlen = 115_866
+    nheads = 128
+    chunk_size = 128
+    parent_width = 18_560  # same overflow margin as the sibling test below
+
+    A = torch.arange(1, nheads + 1, dtype=torch.float32, device=device)
+
+    parent = torch.zeros((1, seqlen, parent_width), dtype=torch.float32, device=device)
+    dt = parent[:, :, -nheads:]
+    position = torch.arange(seqlen, device=device, dtype=torch.float32) % chunk_size
+    dt.copy_(position[None, :, None])
+    assert not dt.is_contiguous()
+    nchunks = math.ceil(seqlen / chunk_size)
+    assert (nchunks - 1) * chunk_size * dt.stride(1) > 2**31 - 1, \
+        "test parameters too small to overflow the pid_c term"
+
+    with torch.no_grad():
+        dA_cumsum, dt_out = _chunk_cumsum_fwd(dt, A, chunk_size)
+    torch.cuda.synchronize(device)
+
+    last_chunk_len = seqlen - (nchunks - 1) * chunk_size
+    j = torch.arange(chunk_size, dtype=torch.float32, device=device)
+    expected_dt_out = j[None, None, None, :].expand(1, nheads, nchunks, chunk_size).clone()
+    expected_dt_out[:, :, -1, last_chunk_len:] = 0.0  # padding past seqlen in the last (partial) chunk
+    torch.testing.assert_close(dt_out, expected_dt_out, rtol=0, atol=0)
+
+    triangular = j * (j + 1) / 2  # sum_{i=0}^{j} i
+    expected_dA_cumsum = (A[None, :, None, None] * triangular[None, None, None, :]).expand(1, nheads, nchunks, chunk_size).clone()
+    # Padding past seqlen in the last (partial) chunk: dt there is masked to 0
+    # before the cumsum, so the running sum plateaus at its last real value
+    # instead of resetting to 0.
+    last_triangular = (last_chunk_len - 1) * last_chunk_len / 2
+    expected_dA_cumsum[:, :, -1, last_chunk_len:] = (A * last_triangular)[None, :, None]
+    torch.testing.assert_close(dA_cumsum, expected_dA_cumsum, rtol=1e-4, atol=1e-4)
+
+
 def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_no_overflow() -> None:
     # int32 overflow in _chunk_cumsum_fwd_kernel/_chunk_cumsum_bwd_kernel,
     # see TODO: LinkToFutureIssueInMamba. Needs dt as a non-contiguous view
     # into a much wider parent tensor (large stride(1)) to trigger.
+    #
+    # isfinite() can't reliably catch this: a wrapped offset can land on
+    # another in-bounds address and read finite-but-wrong values. Compare
+    # against the same kernel run on a contiguous copy of the same values
+    # instead (same pattern as the batch-axis variant below).
     device = 'cuda'
     torch.manual_seed(0)
     seqlen = 115_866
@@ -107,25 +163,38 @@ def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_no_overflow() -> None:
     parent = torch.zeros((1, seqlen, parent_width), dtype=torch.bfloat16, device=device)
     dt = parent[:, :, -nheads:]
     assert not dt.is_contiguous()
+    nchunks = math.ceil(seqlen / chunk_size)
+    assert (nchunks - 1) * chunk_size * dt.stride(1) > 2**31 - 1, \
+        "test parameters too small to overflow the pid_c term"
+    dt_c = dt.contiguous()
 
     with torch.no_grad():
         dA_cumsum, dt_out = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=True)
-        ddA = torch.randn_like(dA_cumsum)
-        ddt_out = torch.randn_like(dt_out)
-        ddt, dA, ddt_bias = _chunk_cumsum_bwd(ddA, ddt_out, dt, A, dt_bias=dt_bias, dt_softplus=True)
+        dA_cumsum_c, dt_out_c = _chunk_cumsum_fwd(dt_c, A, chunk_size, dt_bias=dt_bias, dt_softplus=True)
     torch.cuda.synchronize(device)
 
-    nchunks = math.ceil(seqlen / chunk_size)
     assert dA_cumsum.shape == (1, nheads, nchunks, chunk_size)
     assert dt_out.shape == (1, nheads, nchunks, chunk_size)
     assert torch.isfinite(dA_cumsum).all()
-    assert torch.isfinite(dt_out).all()
+    torch.testing.assert_close(dA_cumsum, dA_cumsum_c, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(dt_out, dt_out_c, rtol=1e-4, atol=1e-4)
+
+    with torch.no_grad():
+        ddA = torch.randn_like(dA_cumsum)
+        ddt_out = torch.randn_like(dt_out)
+        ddt, dA, ddt_bias = _chunk_cumsum_bwd(ddA, ddt_out, dt, A, dt_bias=dt_bias, dt_softplus=True)
+        ddt_c, dA_c, ddt_bias_c = _chunk_cumsum_bwd(ddA, ddt_out, dt_c, A, dt_bias=dt_bias, dt_softplus=True)
+    torch.cuda.synchronize(device)
 
     assert ddt.shape == dt.shape
     assert dA.shape == (nheads,)
     assert torch.isfinite(ddt).all()
-    assert torch.isfinite(dA).all()
-    assert torch.isfinite(ddt_bias).all()
+    torch.testing.assert_close(ddt, ddt_c, rtol=1e-4, atol=1e-4)
+    # Slightly looser: dA is summed over all chunks, and summing in a
+    # different order (contiguous vs. wide-sliced memory layout) causes tiny
+    # float roundoff differences at the ~1e-3 level even for a correct kernel.
+    torch.testing.assert_close(dA, dA_c, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(ddt_bias, ddt_bias_c, rtol=1e-3, atol=1e-3)
 
 
 def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow() -> None:
