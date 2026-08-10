@@ -1341,6 +1341,55 @@ def test_state_passing_fwd_bwd_noncontiguous_states_batch_axis_no_overflow() -> 
     torch.testing.assert_close(ddA, ddA_ref)
 
 
+def test_state_passing_fwd_bwd_noncontiguous_states_dim_axis_no_overflow_known_answer() -> None:
+    # Dim-axis counterpart to the batch-axis known-answer test above,
+    # targeting `offs_m * stride_states_dim` instead. With nchunks = 1
+    # (matching the sibling test below): the fwd kernel's loop runs exactly
+    # once, and since c(=0) < nchunks-1(=0) is false, that iteration writes
+    # straight to final_states instead of out -- so out[0] keeps its
+    # initial-store value of 0 (out never reflects states or dA_chunk_cumsum
+    # at all here), and final_states = exp(dA_cs)*0 + states[0] = states[0]
+    # exactly, regardless of dA_chunk_cumsum's value. Setting
+    # states[0, p] = p (distinct per dim position, not a shared constant)
+    # makes final_states[p] = p a trivial but exact, dim-position-sensitive
+    # closed form -- a misaddressed dim read is caught by reading a
+    # different position's distinct value.
+    #
+    # The backward loop runs range(nchunks - 1) = range(0) times -- zero
+    # iterations -- so with no dfinal_states, dstates is just zeros and
+    # ddA_chunk_cumsum is never written by the kernel at all (its output
+    # buffer is uninitialized `torch.empty`, not meaningfully defined at
+    # this nchunks=1 shape) -- so only dstates is checked below, not ddA.
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=12)
+
+    batch = 1
+    nchunks = 1
+    nheads = 1
+    dim = 100_000
+    pad = 23_400  # (dim - 1) * pad > 2**31 - 1, with ~9% margin
+
+    parent = torch.zeros(batch, nchunks, nheads, dim, pad, dtype=torch.float32, device=device)
+    states = parent[:, :, :, :, 0]
+    p = torch.arange(dim, dtype=torch.float32, device=device)
+    states.copy_(p[None, None, None, :])
+    assert not states.is_contiguous()
+    assert (dim - 1) * states.stride(3) > 2**31 - 1, "test parameters too small to overflow the dim-axis term"
+
+    dA_chunk_cumsum = torch.randn(batch, nheads, nchunks, dtype=torch.float32, device=device)
+
+    out, final_states = _state_passing_fwd(states, dA_chunk_cumsum)
+    torch.cuda.synchronize(device)
+    torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+    expected_final_states = p[None, None, :]
+    torch.testing.assert_close(final_states, expected_final_states, rtol=0, atol=0)
+
+    dout = torch.zeros(batch, nchunks, nheads, dim, dtype=torch.float32, device=device)
+    dstates, _, _ = _state_passing_bwd(out, dA_chunk_cumsum, dout, has_initial_states=False)
+    torch.cuda.synchronize(device)
+    torch.testing.assert_close(dstates, torch.zeros_like(dstates), rtol=0, atol=0)
+
+
 def test_state_passing_fwd_bwd_noncontiguous_states_dim_axis_no_overflow() -> None:
     # Third pid cast in the same kernels: `offs_m * stride_states_dim`,
     # where offs_m is derived from pid_m = tl.program_id(axis=0) (the
