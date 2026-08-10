@@ -1062,6 +1062,84 @@ def test_mamba_split_conv1d_scan_combined_bwd_ensure_stride_copy_path() -> None:
     torch.testing.assert_close(grad_copy, grad_view, msg="backward gradient changed by forcing ensure_stride's copy path")
 
 
+def test_mamba_split_conv1d_scan_combined_fwd_noncontiguous_no_overflow_known_answer() -> None:
+    # Known-answer counterpart to the sibling test below, same real
+    # (not artificially injected) non-contiguous x/B/C split. Two knobs
+    # make the whole pipeline closed-form instead of just isfinite:
+    #
+    # 1. conv1d_weight's last tap = 1 (rest 0), bias = 0, activation=None
+    #    (passed to causal_conv1d_fn) makes the causal conv an exact
+    #    identity -- verified directly against causal_conv1d_fn beforehand.
+    #    So xBC_conv == the raw xBC we write into zxbcdt.
+    # 2. dt_softplus is hardcoded True inside this function, so instead of
+    #    fighting that, dt (pre-softplus) = 1 with dt_bias = 0 gives a
+    #    known dt_after = softplus(1) (computed via the same
+    #    F.softplus primitive, not the kernel under test).
+    #
+    # With x = B = C = 1 (post-"conv"), A = 0, D = 0: this is exactly the
+    # A=0/dt=x=B=C=1 recurrence from the mamba_chunk_scan_combined
+    # known-answer test above, scaled by dt_after instead of 1:
+    #   out_x[t] = dstate * dt_after * (t + 1)
+    # z is not conv'd at all (split raw from zxbcdt), so setting z to a
+    # constant z_const gates the whole thing by a known F.silu(z_const):
+    #   out[t] = out_x[t] * F.silu(z_const)
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=25)
+
+    batch = 1
+    nheads = 289
+    headdim = 64
+    ngroups = 1
+    dstate = 32
+    dim = nheads * headdim
+    chunk_size = 128
+    nchunks = 906
+    seqlen = nchunks * chunk_size
+    conv_width = 4
+
+    width_conv1d = dim + 2 * ngroups * dstate
+    assert width_conv1d == 18_560
+
+    z_const = 2.0
+    dt_raw_val = 1.0
+
+    zxbcdt = torch.zeros(batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads,
+                         dtype=torch.bfloat16, device=device)
+    z_part, xbc_part, dt_part = torch.split(zxbcdt, [dim, width_conv1d, nheads], dim=-1)
+    z_part.fill_(z_const)
+    xbc_part.fill_(1.0)
+    dt_part.fill_(dt_raw_val)
+    assert not xbc_part.is_contiguous()  # real torch.split() view, not an injected wide slice
+
+    conv1d_weight = torch.zeros(width_conv1d, conv_width, dtype=torch.bfloat16, device=device)
+    conv1d_weight[:, -1] = 1.0  # identity tap, verified directly against causal_conv1d_fn
+    conv1d_bias = torch.zeros(width_conv1d, dtype=torch.bfloat16, device=device)
+    dt_bias = torch.zeros(nheads, dtype=torch.float32, device=device)
+    A = torch.zeros(nheads, dtype=torch.float32, device=device)
+    D = torch.zeros(nheads, headdim, dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        out = mamba_split_conv1d_scan_combined(
+            zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, activation=None)
+    torch.cuda.synchronize(device)
+
+    assert out.shape == (batch, seqlen, dim)
+    dt_after = F.softplus(torch.tensor(dt_raw_val, device=device))
+    silu_z = F.silu(torch.tensor(z_const, device=device))
+    t = torch.arange(seqlen, dtype=torch.float32, device=device)
+    expected_col = dstate * dt_after * (t + 1) * silu_z  # (seqlen,) -- same for every dim column
+    # Compare a single column, not the full (seqlen, dim) tensor: the
+    # comparison itself (not the forward pass) OOMs at the full width on a
+    # 48 GiB GPU once both the actual and expected tensors materialize, and
+    # every column is identical by construction anyway -- this still
+    # exercises addressing across the full overflow-triggering seqlen axis.
+    torch.testing.assert_close(out[0, :, 0].float(), expected_col, rtol=1e-2, atol=0)
+    # Also spot-check a few other columns/heads to confirm the uniformity
+    # assumption itself (not just column 0) at negligible extra memory cost.
+    for col in (1, dim // 2, dim - 1):
+        torch.testing.assert_close(out[0, :, col].float(), expected_col, rtol=1e-2, atol=0)
+
+
 def test_mamba_split_conv1d_scan_combined_fwd_noncontiguous_no_overflow() -> None:
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
     # x/B/C are non-contiguous here not via an artificial wide-slice trick
