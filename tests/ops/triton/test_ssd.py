@@ -197,6 +197,53 @@ def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_no_overflow() -> None:
     torch.testing.assert_close(ddt_bias, ddt_bias_c, rtol=1e-3, atol=1e-3)
 
 
+def test_chunk_cumsum_fwd_noncontiguous_wide_view_batch_axis_no_overflow_known_answer() -> None:
+    # Batch-axis counterpart to
+    # test_chunk_cumsum_fwd_noncontiguous_wide_view_no_overflow_known_answer:
+    # targets `pid_b * stride_dt_batch` instead of the pid_c term, only
+    # exercised at batch > 1. Give each batch its own additive offset in dt
+    # (BATCH_OFFSET * b) on top of the same within-chunk position used
+    # there, so a wrapped read that lands on the wrong batch produces a
+    # value offset by a distinguishable multiple of BATCH_OFFSET rather
+    # than one that could coincidentally match.
+    device = 'cuda'
+    skip_if_insufficient_gpu_memory(device, required_gib=6)
+
+    batch = 8
+    seqlen = 8_192
+    nheads = 128
+    chunk_size = 128
+    parent_width = 40_960  # (batch - 1) * seqlen * parent_width > 2**31 - 1, with ~9% margin
+    BATCH_OFFSET = 1000.0
+
+    A = torch.arange(1, nheads + 1, dtype=torch.float32, device=device)
+
+    parent = torch.zeros((batch, seqlen, parent_width), dtype=torch.float32, device=device)
+    dt = parent[:, :, -nheads:]
+    position = torch.arange(seqlen, device=device, dtype=torch.float32) % chunk_size
+    batch_term = torch.arange(batch, device=device, dtype=torch.float32) * BATCH_OFFSET
+    dt.copy_((position[None, :] + batch_term[:, None])[:, :, None])
+    assert not dt.is_contiguous()
+    assert dt.stride(0) * (batch - 1) > 2**31 - 1, "test parameters too small to overflow the batch-axis term"
+
+    with torch.no_grad():
+        dA_cumsum, dt_out = _chunk_cumsum_fwd(dt, A, chunk_size)
+    torch.cuda.synchronize(device)
+
+    nchunks = math.ceil(seqlen / chunk_size)
+    assert nchunks * chunk_size == seqlen, "test assumes seqlen is a whole number of chunks (no padding term below)"
+
+    j = torch.arange(chunk_size, dtype=torch.float32, device=device)
+    expected_dt_out = (j[None, :] + batch_term[:, None])[:, None, None, :].expand(batch, nheads, nchunks, chunk_size)
+    torch.testing.assert_close(dt_out, expected_dt_out, rtol=0, atol=0)
+
+    # sum_{i=0}^{k} (i + b * BATCH_OFFSET) = k(k+1)/2 + (k+1) * b * BATCH_OFFSET
+    triangular = j * (j + 1) / 2
+    per_k = triangular[None, :] + (j[None, :] + 1) * batch_term[:, None]  # (batch, chunk_size)
+    expected_dA_cumsum = (A[None, :, None, None] * per_k[:, None, None, :]).expand(batch, nheads, nchunks, chunk_size)
+    torch.testing.assert_close(dA_cumsum, expected_dA_cumsum, rtol=1e-4, atol=1e-4)
+
+
 def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow() -> None:
     # Distinct overflow term in the same two kernels: `pid_b * stride_dt_batch`,
     # separate from the pid_c term above and only exercised at batch > 1 (the
