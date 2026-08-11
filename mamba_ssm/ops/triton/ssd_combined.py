@@ -47,15 +47,12 @@ from mamba_ssm.utils.determinism import (
     alloc_tile_workspace,
     autotune_configs,
     finalize_tile_workspace,
+    init_to_zero,
     use_deterministic_mode,
 )
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 _UINT32_MAX = 2**32 - 1
-
-
-def init_to_zero(names):
-    return lambda nargs: [nargs[name].zero_() for name in names if nargs[name] is not None]
 
 
 def ensure_stride(inp):
@@ -71,7 +68,9 @@ def ensure_stride(inp):
     operate on a channels_last tensor for which stride[2] is not a multiple of 8, and in that case will
     raise an exception. This function prevents the aforementioned exception by returning a tensor with
     stride(1) equal to channels, by making the returned tensor contiguous, if inp.stride(1) is not
-    already a multiple of 8. Also avoids int32 overflow, see TODO: LinkToFutureIssueInMamba.
+    already a multiple of 8. Also avoids uint32 overflow (causal_conv1d addresses
+    with uint32_t strides, so the limit is _UINT32_MAX, not a signed int32 one),
+    see TODO: LinkToFutureIssueInMamba.
     """
     assert inp.shape[2] % 8 == 0, "Number of convolution channels is required to be a multiple of 8."
     if inp.numel() - 1 > _UINT32_MAX:
