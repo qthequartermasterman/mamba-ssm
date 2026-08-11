@@ -4,28 +4,17 @@ import pytest
 import torch
 
 
-def skip_if_insufficient_gpu_memory(device, required_gib):
-    # Shared by the int32-overflow regression tests, which all need a
-    # wide (large stride(1)) tensor to trigger the bug -- skip rather than
-    # OOM on GPUs that are otherwise perfectly capable of running the suite.
-    total_memory = torch.cuda.get_device_properties(device).total_memory
-    required_memory = required_gib * 1024**3
-    if total_memory < required_memory:
-        pytest.skip(f"GPU has {total_memory / 1024**3:.1f} GiB, need >= {required_gib} GiB")
-
-
 def gpu_memory_skipif(required_gib, device='cuda'):
-    """Decorator form of skip_if_insufficient_gpu_memory, for tests that
-    would rather declare the memory requirement above the def than call it
-    as the first line of the test body:
+    """Shared by the int32-overflow regression tests, which all need a wide
+    (large stride(1)) tensor to trigger the bug -- skip rather than OOM on
+    GPUs that are otherwise perfectly capable of running the suite:
 
         @gpu_memory_skipif(9)
         def test_something_large() -> None:
             ...
 
     Evaluates the GPU's total memory at collection time (not skipped lazily
-    inside the test), so it shows up as SKIPPED (not run) in pytest's
-    summary, with the same reason string as the imperative form.
+    inside the test), so it shows up as SKIPPED (not run) in pytest's summary.
     """
     total_memory = torch.cuda.get_device_properties(device).total_memory
     required_memory = required_gib * 1024**3
