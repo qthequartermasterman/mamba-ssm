@@ -2,10 +2,10 @@ import torch
 
 from mamba_ssm.ops.triton.k_activations import swiglu
 
-from overflow_test_utils import gpu_memory_skipif
+from overflow_test_utils import assert_isfinite, gpu_memory_skipif
 
 
-@gpu_memory_skipif(24)
+@gpu_memory_skipif(13)
 def test_swiglu_large_row_count_no_overflow() -> None:
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
     device = 'cuda'
@@ -18,8 +18,9 @@ def test_swiglu_large_row_count_no_overflow() -> None:
     out = swiglu(xy)
     torch.cuda.synchronize(device)
     assert out.shape == (M, N)
-    assert torch.isfinite(out).all()
+    assert_isfinite(out)
 
     out.sum().backward()
     torch.cuda.synchronize(device)
-    assert xy.grad is not None and torch.isfinite(xy.grad).all()
+    assert xy.grad is not None
+    assert_isfinite(xy.grad)
