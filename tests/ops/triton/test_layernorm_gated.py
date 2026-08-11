@@ -10,7 +10,7 @@ from einops import rearrange, repeat
 
 from mamba_ssm.ops.triton.layernorm_gated import layernorm_fn, rms_norm_ref
 
-from overflow_test_utils import bwd_row_start_max
+from overflow_test_utils import bwd_row_start_max, gpu_memory_skipif
 
 
 @pytest.mark.parametrize("norm_before_gate", [True, False])
@@ -106,6 +106,7 @@ def test_layer_norm_gated(d, dtype, wtype, has_bias, has_z, is_rms_norm, has_gro
         assert (bias.grad - bias_ref.grad).abs().max().item() <= 2 * (bias_pt.grad - bias_ref.grad).abs().max().item() + atol
 
 
+@gpu_memory_skipif(28)
 def test_layer_norm_gated_large_row_count_no_overflow() -> None:
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
     device = 'cuda'

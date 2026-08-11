@@ -2,9 +2,10 @@ import torch
 
 from mamba_ssm.ops.triton.layer_norm import rms_norm_fn
 
-from overflow_test_utils import bwd_row_start_max
+from overflow_test_utils import bwd_row_start_max, gpu_memory_skipif
 
 
+@gpu_memory_skipif(28)
 def test_rms_norm_large_row_count_no_overflow() -> None:
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
     device = 'cuda'

@@ -2,7 +2,10 @@ import torch
 
 from mamba_ssm.ops.triton.k_activations import swiglu
 
+from overflow_test_utils import gpu_memory_skipif
 
+
+@gpu_memory_skipif(24)
 def test_swiglu_large_row_count_no_overflow() -> None:
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
     device = 'cuda'
