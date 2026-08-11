@@ -35,6 +35,16 @@ def gpu_memory_skipif(required_gib, device='cuda'):
     )
 
 
+def assert_isfinite(t, chunk_rows=4096):
+    # torch.isfinite(t).all() on a large low-precision tensor (e.g. bf16)
+    # internally promotes to a full-size fp32 intermediate before reducing,
+    # roughly tripling peak memory over t's own footprint at row counts like
+    # the ones these overflow tests use -- checking row-chunks at a time
+    # keeps that intermediate bounded, at the same full-coverage guarantee.
+    for i in range(0, t.shape[0], chunk_rows):
+        assert torch.isfinite(t[i:i + chunk_rows]).all(), f"non-finite value in rows [{i}, {i + chunk_rows})"
+
+
 def wide_noncontiguous_slices(device, seqlen, parent_width, shapes, batch=None):
     """Allocate ONE (batch, seqlen, parent_width) parent tensor -- or
     (seqlen, parent_width) if batch is None -- and return disjoint,

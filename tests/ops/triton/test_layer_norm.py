@@ -2,10 +2,10 @@ import torch
 
 from mamba_ssm.ops.triton.layer_norm import rms_norm_fn
 
-from overflow_test_utils import bwd_row_start_max, gpu_memory_skipif
+from overflow_test_utils import assert_isfinite, bwd_row_start_max, gpu_memory_skipif
 
 
-@gpu_memory_skipif(28)
+@gpu_memory_skipif(21)
 def test_rms_norm_large_row_count_no_overflow() -> None:
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
     device = 'cuda'
@@ -25,9 +25,10 @@ def test_rms_norm_large_row_count_no_overflow() -> None:
     out = rms_norm_fn(x, weight, bias=None)
     torch.cuda.synchronize(device)
     assert out.shape == (M, N)
-    assert torch.isfinite(out).all()
+    assert_isfinite(out)
 
     out.sum().backward()
     torch.cuda.synchronize(device)
-    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert x.grad is not None
+    assert_isfinite(x.grad)
     assert weight.grad is not None and torch.isfinite(weight.grad).all()
