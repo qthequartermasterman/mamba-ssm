@@ -12,8 +12,6 @@ sanity check performed manually before writing this file, which found ~3.5e-4
 max abs diff between eager and compiled on ordinary inputs with no overflow
 involved at all.
 """
-import math
-
 import pytest
 import torch
 import torch.nn.functional as F
