@@ -26,7 +26,7 @@ from mamba_ssm.ops.triton.ssd_combined import (
     causal_conv1d_bwd_function,
 )
 
-from overflow_test_utils import skip_if_insufficient_gpu_memory, wide_noncontiguous_slices
+from overflow_test_utils import gpu_memory_skipif, wide_noncontiguous_slices
 
 
 def detach_clone(*args):
@@ -90,6 +90,7 @@ def test_chunk_state_varlen(chunk_size, ngroups, dtype):
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
+@gpu_memory_skipif(9)
 def test_chunk_cumsum_fwd_noncontiguous_wide_view_no_overflow_known_answer() -> None:
     # Same overflow as test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_no_overflow
     # below, but instead of comparing against a second (contiguous) kernel
@@ -105,7 +106,6 @@ def test_chunk_cumsum_fwd_noncontiguous_wide_view_no_overflow_known_answer() -> 
     # every (h, k) has a distinct expected value, so a misaddressed read
     # is caught even if it lands in-bounds.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=9)
     seqlen = 115_866
     nheads = 128
     chunk_size = 128
@@ -198,6 +198,7 @@ def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_no_overflow() -> None:
     torch.testing.assert_close(ddt_bias, ddt_bias_c, rtol=1e-3, atol=1e-3)
 
 
+@gpu_memory_skipif(11)
 def test_chunk_cumsum_fwd_noncontiguous_wide_view_batch_axis_no_overflow_known_answer() -> None:
     # Batch-axis counterpart to
     # test_chunk_cumsum_fwd_noncontiguous_wide_view_no_overflow_known_answer:
@@ -208,7 +209,6 @@ def test_chunk_cumsum_fwd_noncontiguous_wide_view_batch_axis_no_overflow_known_a
     # value offset by a distinguishable multiple of BATCH_OFFSET rather
     # than one that could coincidentally match.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=11)
 
     batch = 8
     seqlen = 8_192
@@ -245,6 +245,7 @@ def test_chunk_cumsum_fwd_noncontiguous_wide_view_batch_axis_no_overflow_known_a
     torch.testing.assert_close(dA_cumsum, expected_dA_cumsum, rtol=1e-4, atol=1e-4)
 
 
+@gpu_memory_skipif(6)
 def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow() -> None:
     # Distinct overflow term in the same two kernels: `pid_b * stride_dt_batch`,
     # separate from the pid_c term above and only exercised at batch > 1 (the
@@ -258,7 +259,6 @@ def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow() -
     # against the same kernel run on a contiguous copy of the same values
     # instead.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=6)
 
     torch.manual_seed(0)
     batch = 8
@@ -304,6 +304,7 @@ def test_chunk_cumsum_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow() -
     torch.testing.assert_close(ddt_bias, ddt_bias_c, rtol=1e-3, atol=1e-3)
 
 
+@gpu_memory_skipif(11)
 def test_bmm_chunk_fwd_noncontiguous_wide_view_batch_axis_no_overflow_known_answer() -> None:
     # Batch-axis counterpart to the chunk_cumsum known-answer tests above,
     # targeting _bmm_chunk_fwd_kernel/_bmm_chunk_bwd_kernel's `pid_b`
@@ -321,7 +322,6 @@ def test_bmm_chunk_fwd_noncontiguous_wide_view_batch_axis_no_overflow_known_answ
     # linear in dout, so this holds for ANY dout (no need to also make
     # dout a known constant).
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=11)
 
     batch = 8
     seqlen = 8_192
@@ -360,6 +360,7 @@ def test_bmm_chunk_fwd_noncontiguous_wide_view_batch_axis_no_overflow_known_answ
     torch.testing.assert_close(da.float(), expected_da, rtol=1e-2, atol=0.2)
 
 
+@gpu_memory_skipif(6)
 def test_bmm_chunk_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow() -> None:
     # _bmm_chunk_fwd_kernel/_bmm_chunk_bwd_kernel left `pid_b` uncast (only
     # `pid_ch` was fixed), so `pid_b * stride_a_batch` overflows int32 at
@@ -371,7 +372,6 @@ def test_bmm_chunk_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow() -> N
     # catch this one, but compare against a contiguous copy anyway to also
     # catch a wrapped-but-in-bounds offset if the margin were different.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=6)
 
     torch.manual_seed(0)
     batch = 8
@@ -400,6 +400,7 @@ def test_bmm_chunk_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow() -> N
     torch.testing.assert_close(da.float(), da_c.float(), rtol=1e-4, atol=1e-4)
 
 
+@gpu_memory_skipif(16)
 def test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow_known_answer() -> None:
     # Same overflow (see TODO: LinkToFutureIssueInMamba) and shared-wide-parent
     # setup as the sibling test below, but with constant inputs chosen so the
@@ -420,7 +421,6 @@ def test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow_known_ans
     # reach dstate * seqlen ~= 3.7M, comfortably inside float32's exact
     # integer range (2**24) but well past bfloat16's (2**8).
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=16)
 
     batch = 1
     nheads = 4  # overflow depends only on seqlen/chunk_size/stride, not head count
@@ -461,6 +461,7 @@ def test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow_known_ans
     torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
 
 
+@gpu_memory_skipif(16)
 def test_mamba_chunk_scan_combined_bwd_noncontiguous_wide_view_no_overflow_known_answer() -> None:
     # Backward counterpart to
     # test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow_known_answer.
@@ -482,7 +483,6 @@ def test_mamba_chunk_scan_combined_bwd_noncontiguous_wide_view_no_overflow_known
     # against a T=2, headdim=dstate=1 toy case, and numerically against this
     # test's actual nheads/headdim/dstate before adding tolerances below.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=16)
 
     batch = 1
     nheads = 4  # overflow depends only on seqlen/chunk_size/stride, not head count
@@ -539,6 +539,7 @@ def test_mamba_chunk_scan_combined_bwd_noncontiguous_wide_view_no_overflow_known
         torch.testing.assert_close(grad.float(), expected, rtol=1e-3, atol=0, msg=f"{name}.grad mismatch")
 
 
+@gpu_memory_skipif(6)
 def test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow() -> None:
     # Same overflow class hit through the full mamba_chunk_scan_combined
     # path (see TODO: LinkToFutureIssueInMamba), covering ssd_chunk_scan.py,
@@ -554,7 +555,6 @@ def test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow() -> None
     # realistic head counts). isfinite() alone isn't sufficient either --
     # a wrapped offset can land in-bounds and produce finite, wrong values.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=6)
 
     torch.manual_seed(0)
     batch = 1
@@ -624,6 +624,7 @@ def test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow() -> None
                                    msg=f"{name}.grad mismatch vs contiguous-equivalent")
 
 
+@gpu_memory_skipif(12)
 def test_mamba_chunk_scan_combined_noncontiguous_wide_view_batch_axis_no_overflow_known_answer() -> None:
     # Batch-axis counterpart to the chunk-axis known-answer fwd+bwd tests
     # above (combined into one test here, like the sibling test below,
@@ -648,7 +649,6 @@ def test_mamba_chunk_scan_combined_noncontiguous_wide_view_batch_axis_no_overflo
     # chunk-axis formula times the extra v[b]^2 or v[b]^3 its derivation
     # picks up from the extra non-unit constant.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=12)
 
     batch = 8
     nheads = 16
@@ -709,6 +709,7 @@ def test_mamba_chunk_scan_combined_noncontiguous_wide_view_batch_axis_no_overflo
         torch.testing.assert_close(grad.float(), expected, rtol=1e-3, atol=0, msg=f"{name}.grad mismatch")
 
 
+@gpu_memory_skipif(8)
 def test_mamba_chunk_scan_combined_noncontiguous_wide_view_batch_axis_no_overflow() -> None:
     # Batch-axis counterpart to test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow
     # above: `pid_b * stride_x_batch` (and the analogous B/C/z terms) in
@@ -724,7 +725,6 @@ def test_mamba_chunk_scan_combined_noncontiguous_wide_view_batch_axis_no_overflo
     # (batch - 1) * seqlen * parent_width is what has to clear the
     # threshold here, not (nchunks - 1) * chunk_size * parent_width).
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=8)
 
     torch.manual_seed(0)
     batch = 8
@@ -779,6 +779,7 @@ def test_mamba_chunk_scan_combined_noncontiguous_wide_view_batch_axis_no_overflo
                                    msg=f"{name}.grad mismatch vs contiguous-equivalent")
 
 
+@gpu_memory_skipif(12)
 def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow_known_answer() -> None:
     # Known-answer counterpart to the sibling test below, targeting the
     # same wide, non-contiguous dout (the incoming gradient from autograd
@@ -796,7 +797,6 @@ def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow_known_answ
     # 0*x adds nothing to the forward output, so it doesn't disturb the
     # formulas above, and dD = sum_t(dout * x) = T at this operating point.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=12)
 
     batch = 1
     nheads = 16
@@ -843,6 +843,7 @@ def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow_known_answ
         torch.testing.assert_close(g.float(), expected, rtol=1e-3, atol=0, msg=f"{name} mismatch")
 
 
+@gpu_memory_skipif(6)
 def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow() -> None:
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
     # dout is the incoming gradient from autograd, so unlike x/dt/B/C (all
@@ -850,7 +851,6 @@ def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow() -> None:
     # with an arbitrary, caller-controlled large stride -- e.g. sliced out
     # of a wider fused gradient tensor upstream.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=6)
 
     torch.manual_seed(0)
     batch = 1
@@ -948,6 +948,7 @@ def test_causal_conv1d_bwd_dx_given_ensure_stride_copy_path() -> None:
     torch.testing.assert_close(dxBC_given, dx_ref_bsd, msg="copy-path repair diverged from ground truth")
 
 
+@gpu_memory_skipif(25)
 def test_causal_conv1d_bwd_dx_given_wide_batch_stride_no_overflow() -> None:
     # Real bug, not a hypothetical: dxBC_given is a slice of the wide dzxbcdt tensor,
     # so it inherits dzxbcdt's batch stride. Passing it directly as the `dx` output
@@ -964,7 +965,6 @@ def test_causal_conv1d_bwd_dx_given_wide_batch_stride_no_overflow() -> None:
     # against two broken alternatives: passing dxBC_given as `dx` with no
     # ensure_stride at all, and with ensure_stride but no copy-back repair.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=25)
     torch.manual_seed(0)
 
     batch, seqlen, parent_width, channels, width = 4, 40960, 35072, 8, 4
@@ -1063,6 +1063,7 @@ def test_mamba_split_conv1d_scan_combined_bwd_ensure_stride_copy_path() -> None:
     torch.testing.assert_close(grad_copy, grad_view, msg="backward gradient changed by forcing ensure_stride's copy path")
 
 
+@gpu_memory_skipif(26)
 def test_mamba_split_conv1d_scan_combined_fwd_noncontiguous_no_overflow_known_answer() -> None:
     # Known-answer counterpart to the sibling test below, same real
     # (not artificially injected) non-contiguous x/B/C split. Two knobs
@@ -1085,7 +1086,6 @@ def test_mamba_split_conv1d_scan_combined_fwd_noncontiguous_no_overflow_known_an
     # constant z_const gates the whole thing by a known F.silu(z_const):
     #   out[t] = out_x[t] * F.silu(z_const)
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=26)
 
     batch = 1
     nheads = 289
@@ -1141,6 +1141,7 @@ def test_mamba_split_conv1d_scan_combined_fwd_noncontiguous_no_overflow_known_an
         torch.testing.assert_close(out[0, :, col].float(), expected_col, rtol=1e-2, atol=0)
 
 
+@gpu_memory_skipif(25)
 def test_mamba_split_conv1d_scan_combined_fwd_noncontiguous_no_overflow() -> None:
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
     # x/B/C are non-contiguous here not via an artificial wide-slice trick
@@ -1151,7 +1152,6 @@ def test_mamba_split_conv1d_scan_combined_fwd_noncontiguous_no_overflow() -> Non
     # Nemotron-scale in_proj width (dim + 2*ngroups*dstate = 18,560) so the
     # split's stride(1) alone exceeds the int32 threshold over ~900 chunks.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=25)
 
     torch.manual_seed(0)
     batch = 1
@@ -1186,6 +1186,7 @@ def test_mamba_split_conv1d_scan_combined_fwd_noncontiguous_no_overflow() -> Non
         assert torch.isfinite(out).all()
 
 
+@gpu_memory_skipif(12)
 def test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow_known_answer() -> None:
     # Known-answer counterpart to the sibling test below, same wide,
     # non-contiguous dA_chunk_cumsum setup. The fwd kernel implements
@@ -1219,7 +1220,6 @@ def test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow_known_a
     # against torch.autograd through the real StatePassingFn, before
     # committing to this closed form.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=12)
 
     batch = 1
     nheads = 128
@@ -1267,6 +1267,7 @@ def test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow_known_a
     torch.testing.assert_close(ddA, expected_ddA, rtol=1e-3, atol=0)
 
 
+@gpu_memory_skipif(12)
 def test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow() -> None:
     # int64 to avoid int32 overflow, see TODO: LinkToFutureIssueInMamba.
     # dA_chunk_cumsum is *always* non-contiguous in production
@@ -1276,7 +1277,6 @@ def test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow() -> No
     # and cheap; only the padding dim (not nheads/nchunks/dim) needs to be
     # huge to hit the threshold.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=12)
 
     torch.manual_seed(0)
     batch = 1
@@ -1309,6 +1309,7 @@ def test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow() -> No
     torch.testing.assert_close(ddA, ddA_ref)
 
 
+@gpu_memory_skipif(12)
 def test_state_passing_fwd_bwd_noncontiguous_states_batch_axis_no_overflow_known_answer() -> None:
     # Batch-axis counterpart to the dA_chunk_cumsum known-answer test above,
     # targeting `pid_b * stride_states_batch` instead. `states` (the
@@ -1328,7 +1329,6 @@ def test_state_passing_fwd_bwd_noncontiguous_states_batch_axis_no_overflow_known
     # nheads = dim = 1 here (matching the sibling test's minimal shape), so
     # there's no extra dim-summation factor this time.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=12)
 
     batch = 8
     nchunks = 2
@@ -1375,6 +1375,7 @@ def test_state_passing_fwd_bwd_noncontiguous_states_batch_axis_no_overflow_known
     torch.testing.assert_close(ddA, expected_ddA, rtol=1e-4, atol=0)
 
 
+@gpu_memory_skipif(12)
 def test_state_passing_fwd_bwd_noncontiguous_states_batch_axis_no_overflow() -> None:
     # Batch-axis counterpart to test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow
     # above: same pid_bc = tl.program_id(...).to(tl.int64) pattern, but for
@@ -1387,7 +1388,6 @@ def test_state_passing_fwd_bwd_noncontiguous_states_batch_axis_no_overflow() -> 
     # split, so there's no way to shrink this one below roughly
     # threshold * dtype_size total memory.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=12)
 
     torch.manual_seed(0)
     batch = 8
@@ -1420,6 +1420,7 @@ def test_state_passing_fwd_bwd_noncontiguous_states_batch_axis_no_overflow() -> 
     torch.testing.assert_close(ddA, ddA_ref)
 
 
+@gpu_memory_skipif(12)
 def test_state_passing_fwd_bwd_noncontiguous_states_dim_axis_no_overflow_known_answer() -> None:
     # Dim-axis counterpart to the batch-axis known-answer test above,
     # targeting `offs_m * stride_states_dim` instead. With nchunks = 1
@@ -1440,7 +1441,6 @@ def test_state_passing_fwd_bwd_noncontiguous_states_dim_axis_no_overflow_known_a
     # buffer is uninitialized `torch.empty`, not meaningfully defined at
     # this nchunks=1 shape) -- so only dstates is checked below, not ddA.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=12)
 
     batch = 1
     nchunks = 1
@@ -1469,6 +1469,7 @@ def test_state_passing_fwd_bwd_noncontiguous_states_dim_axis_no_overflow_known_a
     torch.testing.assert_close(dstates, torch.zeros_like(dstates), rtol=0, atol=0)
 
 
+@gpu_memory_skipif(12)
 def test_state_passing_fwd_bwd_noncontiguous_states_dim_axis_no_overflow() -> None:
     # Third pid cast in the same kernels: `offs_m * stride_states_dim`,
     # where offs_m is derived from pid_m = tl.program_id(axis=0) (the
@@ -1484,7 +1485,6 @@ def test_state_passing_fwd_bwd_noncontiguous_states_dim_axis_no_overflow() -> No
     # cast crashes with an illegal memory access at this exact scale, same
     # as the pid_b/ssd_bmm cases -- this was not just a theoretical gap.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=12)
 
     torch.manual_seed(0)
     batch = 1
@@ -1517,6 +1517,7 @@ def test_state_passing_fwd_bwd_noncontiguous_states_dim_axis_no_overflow() -> No
     torch.testing.assert_close(ddA, ddA_ref)
 
 
+@gpu_memory_skipif(9)
 def test_chunk_state_varlen_noncontiguous_wide_view_no_overflow_known_answer() -> None:
     # Known-answer counterpart to the sibling test below. chunk_state_varlen
     # recombines the inter-chunk chunk_states with an intra-chunk running
@@ -1531,7 +1532,6 @@ def test_chunk_state_varlen_noncontiguous_wide_view_no_overflow_known_answer() -
     # a wrong end_idx (from a misaddressed cu_seqlens load) would give some
     # other, wrong count instead, still exact and still distinguishable.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=9)
 
     nheads = 8
     headdim = 64
@@ -1574,12 +1574,12 @@ def test_chunk_state_varlen_noncontiguous_wide_view_no_overflow_known_answer() -
     torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
 
 
+@gpu_memory_skipif(6)
 def test_chunk_state_varlen_noncontiguous_wide_view_no_overflow() -> None:
     # Same overflow class in _chunk_state_varlen_kernel, see
     # TODO: LinkToFutureIssueInMamba. pid_c here comes from a loaded
     # cu_seqlens value rather than tl.program_id() directly.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=6)
 
     torch.manual_seed(0)
     nheads = 8
@@ -1623,6 +1623,7 @@ def test_chunk_state_varlen_noncontiguous_wide_view_no_overflow() -> None:
     torch.testing.assert_close(out.float(), out_c.float(), rtol=1e-4, atol=1e-4)
 
 
+@gpu_memory_skipif(11)
 def test_chunk_state_varlen_batch_axis_no_overflow_known_answer() -> None:
     # Known-answer counterpart to the sibling test below, targeting the
     # same `pid_b * stride_states_batch` term. Every sequence here is
@@ -1641,7 +1642,6 @@ def test_chunk_state_varlen_batch_axis_no_overflow_known_answer() -> None:
     # wrapped store landing in the wrong batch slot is caught.
     #
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=11)
 
     batch = 65_000
     nheads, headdim, dstate, ngroups = 8, 64, 72, 8
@@ -1683,6 +1683,7 @@ def test_chunk_state_varlen_batch_axis_no_overflow_known_answer() -> None:
         torch.testing.assert_close(states[:, h, p, n].float(), expected_col, rtol=1e-3, atol=0)
 
 
+@gpu_memory_skipif(8)
 def test_chunk_state_varlen_batch_axis_no_overflow() -> None:
     # Distinct overflow term in the same kernel: `pid_b * stride_states_batch`
     # (states_ptr, the varlen output buffer), separate from the pid_c term
@@ -1702,7 +1703,6 @@ def test_chunk_state_varlen_batch_axis_no_overflow() -> None:
     # Confirmed via direct reproduction before this fix: reverting pid_b's
     # cast crashes with an illegal memory access at this exact scale.
     device = 'cuda'
-    skip_if_insufficient_gpu_memory(device, required_gib=8)
 
     torch.manual_seed(0)
     batch = 65_000
