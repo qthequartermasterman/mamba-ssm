@@ -14,6 +14,27 @@ def skip_if_insufficient_gpu_memory(device, required_gib):
         pytest.skip(f"GPU has {total_memory / 1024**3:.1f} GiB, need >= {required_gib} GiB")
 
 
+def gpu_memory_skipif(required_gib, device='cuda'):
+    """Decorator form of skip_if_insufficient_gpu_memory, for tests that
+    would rather declare the memory requirement above the def than call it
+    as the first line of the test body:
+
+        @gpu_memory_skipif(9)
+        def test_something_large() -> None:
+            ...
+
+    Evaluates the GPU's total memory at collection time (not skipped lazily
+    inside the test), so it shows up as SKIPPED (not run) in pytest's
+    summary, with the same reason string as the imperative form.
+    """
+    total_memory = torch.cuda.get_device_properties(device).total_memory
+    required_memory = required_gib * 1024**3
+    return pytest.mark.skipif(
+        total_memory < required_memory,
+        reason=f"GPU has {total_memory / 1024**3:.1f} GiB, need >= {required_gib} GiB",
+    )
+
+
 def wide_noncontiguous_slices(device, seqlen, parent_width, shapes, batch=None):
     """Allocate ONE (batch, seqlen, parent_width) parent tensor -- or
     (seqlen, parent_width) if batch is None -- and return disjoint,
