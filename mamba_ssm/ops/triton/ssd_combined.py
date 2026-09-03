@@ -120,7 +120,8 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
     IS_TRITON_22: tl.constexpr,
     DETERMINISTIC_REDUCTION: tl.constexpr,
 ):
-    pid_bc = tl.program_id(axis=1)
+    # int64 to avoid int32 overflow, see https://github.com/state-spaces/mamba/issues/1015
+    pid_bc = tl.program_id(axis=1).to(tl.int64)
     pid_c = pid_bc // batch
     pid_b = pid_bc - pid_c * batch
     pid_h = tl.program_id(axis=2)
@@ -399,8 +400,6 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
                                    dt_limit=(0.0, float("inf")),
                                    dx=None, ddt=None, dB=None, dC=None, dz=None, recompute_output=False,
                                    state_dtype=None):
-    if dout.stride(-1) != 1:
-        dout = dout.contiguous()
     batch, seqlen, nheads, headdim = x.shape
     nchunks = math.ceil(seqlen / chunk_size)
     _, _, ngroups, dstate = B.shape

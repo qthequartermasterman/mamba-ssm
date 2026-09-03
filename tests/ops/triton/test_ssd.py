@@ -400,6 +400,502 @@ def test_bmm_chunk_fwd_bwd_noncontiguous_wide_view_batch_axis_no_overflow() -> N
     torch.testing.assert_close(da.float(), da_c.float(), rtol=1e-4, atol=1e-4)
 
 
+@gpu_memory_skipif(16)
+def test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow_known_answer() -> None:
+    # Same overflow (see https://github.com/state-spaces/mamba/issues/1015) and shared-wide-parent
+    # setup as the sibling test below, but with constant inputs chosen so the
+    # SSM recurrence has an exact closed-form answer, instead of relying on
+    # ssd_chunk_scan_combined_ref (unusable here per its own docstring) or a
+    # self-consistency check against a contiguous copy.
+    #
+    # With A = 0 (no decay), dt = 1, x = B = C = 1, D = None, z = None: the
+    # recurrence state[t] = state[t-1] + dt[t] * B[t] * x[t] simplifies to
+    # state[t][p, n] = t + 1 (0-indexed t) for every head/p/n, and
+    # out[t, h, p] = C[t]^T state[t] = dstate * (t + 1) -- exact regardless
+    # of how the chunked algorithm internally splits the recurrence, since
+    # this is just the true SSM math, not an approximation of it. z is
+    # dropped here (silu(z) has no simple closed form) -- the sibling test
+    # below still covers z's own overflow addressing.
+    #
+    # float32 (not the sibling's bfloat16) throughout: state/out values here
+    # reach dstate * seqlen ~= 3.7M, comfortably inside float32's exact
+    # integer range (2**24) but well past bfloat16's (2**8).
+    device = 'cuda'
+
+    batch = 1
+    nheads = 4  # overflow depends only on seqlen/chunk_size/stride, not head count
+    headdim = 64
+    ngroups = 1
+    dstate = 32
+    chunk_size = 128
+    nchunks = 906  # (nchunks - 1) * chunk_size * 18_560 > 2**31 - 1
+    seqlen = nchunks * chunk_size
+    parent_width = 18_560  # same width that overflowed in the ssd_chunk_state.py bug
+
+    parent = torch.zeros((batch, seqlen, parent_width), dtype=torch.float32, device=device)
+    offset = 0
+    x = parent[..., offset:offset + nheads * headdim].view(batch, seqlen, nheads, headdim)
+    offset += nheads * headdim
+    B = parent[..., offset:offset + ngroups * dstate].view(batch, seqlen, ngroups, dstate)
+    offset += ngroups * dstate
+    C = parent[..., offset:offset + ngroups * dstate].view(batch, seqlen, ngroups, dstate)
+    offset += ngroups * dstate
+    x.fill_(1.0)
+    B.fill_(1.0)
+    C.fill_(1.0)
+    assert not x.is_contiguous()
+    assert not B.is_contiguous()
+    assert not C.is_contiguous()
+    assert (nchunks - 1) * chunk_size * B.stride(1) > 2**31 - 1, \
+        "test parameters too small to overflow the pid_c term"
+
+    dt = torch.ones(batch, seqlen, nheads, dtype=torch.float32, device=device)
+    A = torch.zeros(nheads, dtype=torch.float32, device=device)
+
+    out = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size)
+    torch.cuda.synchronize(device)
+
+    assert out.shape == (batch, seqlen, nheads, headdim)
+    t = torch.arange(seqlen, dtype=torch.float32, device=device)
+    expected_out = (dstate * (t + 1))[None, :, None, None].expand(batch, seqlen, nheads, headdim)
+    torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+
+
+@gpu_memory_skipif(16)
+def test_mamba_chunk_scan_combined_bwd_noncontiguous_wide_view_no_overflow_known_answer() -> None:
+    # Backward counterpart to
+    # test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow_known_answer.
+    # Unrolling the recurrence with decay exp(A*(t-t')) between steps t' and
+    # t gives state[t,p,n] = sum_{t'<=t} exp(A*(t-t')) * dt[t'] * x[t'][p] * B[t'][n].
+    # Differentiating at the same operating point (A=0, dt=x=B=C=1) and
+    # summing over the L = out.sum() loss gives, with T = seqlen and
+    # 0-indexed t (ngroups=1 below, so all nheads heads share the same B/C --
+    # their gradients pick up a factor of nheads from that sharing; x/dt/A
+    # are per-head already and don't):
+    #   dC[t]  = nheads * headdim * (t + 1)
+    #   dB[t]  = nheads * headdim * (T - t)
+    #   dx[t]  = dstate * (T - t)
+    #   ddt[t] = headdim * dstate * (T - t)
+    #   dA     = headdim * dstate * (T + 1) * T * (T - 1) / 6
+    # dt and A only pick up their direct multiplicative contribution here:
+    # d(exp(A*dt))/dt = A*exp(A*dt) = 0 at A=0, so unlike dA, ddt's formula
+    # doesn't need to account for the decay term at all. Verified by hand
+    # against a T=2, headdim=dstate=1 toy case, and numerically against this
+    # test's actual nheads/headdim/dstate before adding tolerances below.
+    device = 'cuda'
+
+    batch = 1
+    nheads = 4  # overflow depends only on seqlen/chunk_size/stride, not head count
+    headdim = 64
+    ngroups = 1
+    dstate = 32
+    chunk_size = 128
+    nchunks = 906  # (nchunks - 1) * chunk_size * 18_560 > 2**31 - 1
+    seqlen = nchunks * chunk_size
+    parent_width = 18_560  # same width that overflowed in the ssd_chunk_state.py bug
+
+    parent = torch.zeros((batch, seqlen, parent_width), dtype=torch.float32, device=device)
+    offset = 0
+    x = parent[..., offset:offset + nheads * headdim].view(batch, seqlen, nheads, headdim)
+    offset += nheads * headdim
+    B = parent[..., offset:offset + ngroups * dstate].view(batch, seqlen, ngroups, dstate)
+    offset += ngroups * dstate
+    C = parent[..., offset:offset + ngroups * dstate].view(batch, seqlen, ngroups, dstate)
+    offset += ngroups * dstate
+    x.fill_(1.0)
+    B.fill_(1.0)
+    C.fill_(1.0)
+    assert not x.is_contiguous()
+    assert not B.is_contiguous()
+    assert not C.is_contiguous()
+    assert (nchunks - 1) * chunk_size * B.stride(1) > 2**31 - 1, \
+        "test parameters too small to overflow the pid_c term"
+
+    dt = torch.ones(batch, seqlen, nheads, dtype=torch.float32, device=device)
+    A = torch.zeros(nheads, dtype=torch.float32, device=device)
+    # requires_grad_() must be called in place, not via .clone() first --
+    # .clone() silently makes x/B/C contiguous, defeating this test entirely.
+    for tensor in (x, B, C, dt, A):
+        tensor.requires_grad_()
+
+    out = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size)
+    out.sum().backward()
+    torch.cuda.synchronize(device)
+
+    T = seqlen
+    t = torch.arange(seqlen, dtype=torch.float32, device=device)
+    for name, grad, expected in [
+        ("C", C.grad, (nheads * headdim * (t + 1))[None, :, None, None].expand(batch, seqlen, ngroups, dstate)),
+        ("B", B.grad, (nheads * headdim * (T - t))[None, :, None, None].expand(batch, seqlen, ngroups, dstate)),
+        ("x", x.grad, (dstate * (T - t))[None, :, None, None].expand(batch, seqlen, nheads, headdim)),
+        ("dt", dt.grad, (headdim * dstate * (T - t))[None, :, None].expand(batch, seqlen, nheads)),
+        ("A", A.grad, torch.full((nheads,), headdim * dstate * (T + 1) * T * (T - 1) / 6, device=device)),
+    ]:
+        assert grad is not None, f"{name}.grad is None"
+        # Loose relative tolerance: these sums grow with T (up to ~1e17 for
+        # dA), well past float32's exact-integer range, and the kernels
+        # accumulate in float32 across ~900 chunks -- roundoff at the
+        # ~1e-3 relative level is expected here even for a correct kernel.
+        torch.testing.assert_close(grad.float(), expected, rtol=1e-3, atol=0, msg=f"{name}.grad mismatch")
+
+
+@gpu_memory_skipif(6)
+def test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow() -> None:
+    # Same overflow class hit through the full mamba_chunk_scan_combined
+    # path (see https://github.com/state-spaces/mamba/issues/1015), covering ssd_chunk_scan.py,
+    # ssd_combined.py, and ssd_bmm.py's kernels too. x, B, C, and z are all
+    # sliced non-contiguously out of a shared wide parent tensor (not just
+    # x). Backward is exercised too, since several of the fixed kernels
+    # only run there, not under a forward-only no_grad call.
+    #
+    # Compares the same kernel run on wide-sliced vs. an ordinary
+    # .contiguous() copy of identical values, rather than
+    # ssd_chunk_scan_combined_ref (unusable here: NaNs at this chunk count
+    # even for a correct kernel, per its own docstring, and OOMs at
+    # realistic head counts). isfinite() alone isn't sufficient either --
+    # a wrapped offset can land in-bounds and produce finite, wrong values.
+    device = 'cuda'
+
+    torch.manual_seed(0)
+    batch = 1
+    # Small nheads: holding x/z/B/C, their contiguous copies, and both
+    # autograd graphs at once OOMs at realistic head counts; the overflow
+    # depends only on seqlen/chunk_size/stride, not head count.
+    nheads = 16
+    headdim = 64
+    ngroups = 1
+    dstate = 32
+    chunk_size = 128
+    nchunks = 906  # (nchunks - 1) * chunk_size * 18_560 > 2**31 - 1
+    seqlen = nchunks * chunk_size
+    parent_width = 18_560  # same width that overflowed in the ssd_chunk_state.py bug
+
+    # x, z, B, and C are ALL sliced non-contiguously out of the SAME wide
+    # parent tensor here (disjoint column ranges, via wide_noncontiguous_slices),
+    # rather than one wide parent per tensor -- one ~4 GiB allocation instead
+    # of four.
+    x, z, B, C = wide_noncontiguous_slices(
+        device, seqlen, parent_width,
+        [(nheads, headdim), (nheads, headdim), (ngroups, dstate), (ngroups, dstate)],
+        batch=batch,
+    )
+    assert not x.is_contiguous()
+    assert not z.is_contiguous()
+    assert not B.is_contiguous()
+    assert not C.is_contiguous()
+    # (nchunks - 1) * chunk_size * stride(1) overflow check for B/C
+    assert (nchunks - 1) * chunk_size * B.stride(1) > 2**31 - 1
+
+    dt = F.softplus(torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=device) - 4)
+    A = -torch.rand(nheads, dtype=torch.float32, device=device) - 0.01
+    D = torch.randn(nheads, headdim, dtype=torch.float32, device=device)
+
+    # x/z/B/C: requires_grad_() must be called in place, not via .clone()
+    # first -- .clone() silently makes a non-contiguous tensor contiguous,
+    # which would defeat this test entirely.
+    x_c, z_c, B_c, C_c = [t.contiguous() for t in (x, z, B, C)]
+    dt_c, A_c, D_c = [t.clone() for t in (dt, A, D)]
+    for t in (x, z, B, C, dt, A, D, x_c, z_c, B_c, C_c, dt_c, A_c, D_c):
+        t.requires_grad_()
+    assert not x.is_contiguous() and x_c.is_contiguous()
+    assert not B.is_contiguous() and B_c.is_contiguous()
+
+    out = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=D, z=z)
+    out_c = mamba_chunk_scan_combined(x_c, dt_c, A_c, B_c, C_c, chunk_size, D=D_c, z=z_c)
+    torch.cuda.synchronize(device)
+
+    assert out.shape == (batch, seqlen, nheads, headdim)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.float(), out_c.float(), rtol=1e-4, atol=1e-4)
+
+    out.sum().backward()
+    out_c.sum().backward()
+    torch.cuda.synchronize(device)
+    grad_pairs = [("x", x, x_c), ("z", z, z_c), ("B", B, B_c), ("C", C, C_c),
+                  ("dt", dt, dt_c), ("A", A, A_c), ("D", D, D_c)]
+    for name, t, t_c in grad_pairs:
+        assert t.grad is not None, f"{name}.grad is None"
+        assert torch.isfinite(t.grad).all(), f"{name}.grad has non-finite values"
+        # Slightly looser than the forward check: A.grad and D.grad are
+        # summed over all ~900 chunks, and summing in a different order
+        # (contiguous vs. wide-sliced memory layout) causes tiny float
+        # roundoff differences at the ~1e-3 level even for a correct kernel.
+        torch.testing.assert_close(t.grad.float(), t_c.grad.float(), rtol=1e-3, atol=1e-3,
+                                   msg=f"{name}.grad mismatch vs contiguous-equivalent")
+
+
+@gpu_memory_skipif(12)
+def test_mamba_chunk_scan_combined_noncontiguous_wide_view_batch_axis_no_overflow_known_answer() -> None:
+    # Batch-axis counterpart to the chunk-axis known-answer fwd+bwd tests
+    # above (combined into one test here, like the sibling test below,
+    # since batch=8/nchunks=64 is cheap enough not to need splitting).
+    #
+    # Same A=0, dt=1, D=None, z=None setup, but x = B = C = v[b] = b + 1
+    # (batch-dependent, not just 1) so a wrapped read landing on the wrong
+    # batch reads a different, distinguishable v. With decay=1:
+    #   state[t,p,n] = v[b]^2 * (t + 1)
+    #   out[t,p]     = dstate * v[b]^3 * (t + 1)
+    # Differentiating (ngroups=1, so B/C are shared across all nheads
+    # heads and pick up a factor of nheads; A is shared across all
+    # batches, so its gradient sums v[b]^3 over every batch):
+    #   dC[t,b]  = nheads * headdim * v[b]^2 * (t + 1)
+    #   dB[t,b]  = nheads * headdim * v[b]^2 * (T - t)
+    #   dx[t,b]  = dstate * v[b]^2 * (T - t)
+    #   ddt[t,b] = headdim * dstate * v[b]^3 * (T - t)
+    #   dA[h]    = headdim * dstate * (T + 1) * T * (T - 1) / 6 * sum_b(v[b]^3)
+    # Derived the same way as the chunk-axis version: general partial
+    # derivatives of the trilinear-in-(x,B,C) recurrence, then evaluated
+    # at x=B=C=v[b] instead of x=B=C=1 -- every term above is exactly the
+    # chunk-axis formula times the extra v[b]^2 or v[b]^3 its derivation
+    # picks up from the extra non-unit constant.
+    device = 'cuda'
+
+    batch = 8
+    nheads = 16
+    headdim = 64
+    ngroups = 1
+    dstate = 32
+    chunk_size = 128
+    nchunks = 64
+    seqlen = nchunks * chunk_size
+    parent_width = 40_960  # (batch - 1) * seqlen * parent_width > 2**31 - 1, with ~9% margin
+
+    parent = torch.zeros((batch, seqlen, parent_width), dtype=torch.float32, device=device)
+    offset = 0
+    x = parent[..., offset:offset + nheads * headdim].view(batch, seqlen, nheads, headdim)
+    offset += nheads * headdim
+    B = parent[..., offset:offset + ngroups * dstate].view(batch, seqlen, ngroups, dstate)
+    offset += ngroups * dstate
+    C = parent[..., offset:offset + ngroups * dstate].view(batch, seqlen, ngroups, dstate)
+    offset += ngroups * dstate
+    v = torch.arange(1, batch + 1, dtype=torch.float32, device=device)
+    x.copy_(v[:, None, None, None])
+    B.copy_(v[:, None, None, None])
+    C.copy_(v[:, None, None, None])
+    assert not x.is_contiguous()
+    assert not B.is_contiguous()
+    assert not C.is_contiguous()
+    assert (batch - 1) * x.stride(0) > 2**31 - 1, "test parameters too small to overflow the batch-axis term"
+
+    dt = torch.ones(batch, seqlen, nheads, dtype=torch.float32, device=device)
+    A = torch.zeros(nheads, dtype=torch.float32, device=device)
+    for tensor in (x, B, C, dt, A):
+        tensor.requires_grad_()
+
+    out = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size)
+    torch.cuda.synchronize(device)
+
+    assert out.shape == (batch, seqlen, nheads, headdim)
+    T = seqlen
+    t = torch.arange(seqlen, dtype=torch.float32, device=device)
+    expected_out = (dstate * v[:, None] ** 3 * (t + 1)[None, :])[:, :, None, None].expand(batch, seqlen, nheads, headdim)
+    torch.testing.assert_close(out, expected_out, rtol=1e-3, atol=0)
+
+    out.sum().backward()
+    torch.cuda.synchronize(device)
+
+    v2, v3 = v**2, v**3
+    for name, grad, expected in [
+        ("C", C.grad, (nheads * headdim * v2[:, None] * (t + 1)[None, :])[:, :, None, None].expand(batch, seqlen, ngroups, dstate)),
+        ("B", B.grad, (nheads * headdim * v2[:, None] * (T - t)[None, :])[:, :, None, None].expand(batch, seqlen, ngroups, dstate)),
+        ("x", x.grad, (dstate * v2[:, None] * (T - t)[None, :])[:, :, None, None].expand(batch, seqlen, nheads, headdim)),
+        ("dt", dt.grad, (headdim * dstate * v3[:, None] * (T - t)[None, :])[:, :, None].expand(batch, seqlen, nheads)),
+        ("A", A.grad, torch.full((nheads,), headdim * dstate * (T + 1) * T * (T - 1) / 6 * v3.sum().item(), device=device)),
+    ]:
+        assert grad is not None, f"{name}.grad is None"
+        # Same loose relative tolerance as the chunk-axis version: float32
+        # accumulation roundoff over many chunks/timesteps, not a sign of a
+        # real bug.
+        torch.testing.assert_close(grad.float(), expected, rtol=1e-3, atol=0, msg=f"{name}.grad mismatch")
+
+
+@gpu_memory_skipif(8)
+def test_mamba_chunk_scan_combined_noncontiguous_wide_view_batch_axis_no_overflow() -> None:
+    # Batch-axis counterpart to test_mamba_chunk_scan_combined_noncontiguous_wide_view_no_overflow
+    # above: `pid_b * stride_x_batch` (and the analogous B/C/z terms) in
+    # _chunk_state_fwd/bwd_dx/bwd_db_kernel, the seven live ssd_chunk_scan.py
+    # kernels, and _chunk_scan_chunk_state_bwd_dx_kernel -- all reached
+    # through this same mamba_chunk_scan_combined call, all sharing the
+    # pid_bc = tl.program_id(1).to(tl.int64) pattern -- only ever had their
+    # chunk-axis half (pid_c) exercised by a real test; batch=1 there meant
+    # pid_b was always 0. See https://github.com/state-spaces/mamba/issues/1015.
+    #
+    # Same setup as the chunk-axis version, but batch=8 with a much smaller
+    # nchunks (cheap: seqlen no longer needs to be large on its own, since
+    # (batch - 1) * seqlen * parent_width is what has to clear the
+    # threshold here, not (nchunks - 1) * chunk_size * parent_width).
+    device = 'cuda'
+
+    torch.manual_seed(0)
+    batch = 8
+    nheads = 16
+    headdim = 64
+    ngroups = 1
+    dstate = 32
+    chunk_size = 128
+    nchunks = 64
+    seqlen = nchunks * chunk_size
+    parent_width = 40_960  # (batch - 1) * seqlen * parent_width > 2**31 - 1, with ~9% margin
+
+    x, z, B, C = wide_noncontiguous_slices(
+        device, seqlen, parent_width,
+        [(nheads, headdim), (nheads, headdim), (ngroups, dstate), (ngroups, dstate)],
+        batch=batch,
+    )
+    assert not x.is_contiguous()
+    assert not z.is_contiguous()
+    assert not B.is_contiguous()
+    assert not C.is_contiguous()
+    assert (batch - 1) * x.stride(0) > 2**31 - 1, "test parameters too small to overflow the batch-axis term"
+
+    dt = F.softplus(torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=device) - 4)
+    A = -torch.rand(nheads, dtype=torch.float32, device=device) - 0.01
+    D = torch.randn(nheads, headdim, dtype=torch.float32, device=device)
+
+    x_c, z_c, B_c, C_c = [t.contiguous() for t in (x, z, B, C)]
+    dt_c, A_c, D_c = [t.clone() for t in (dt, A, D)]
+    for t in (x, z, B, C, dt, A, D, x_c, z_c, B_c, C_c, dt_c, A_c, D_c):
+        t.requires_grad_()
+    assert not x.is_contiguous() and x_c.is_contiguous()
+    assert not B.is_contiguous() and B_c.is_contiguous()
+
+    out = mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=D, z=z)
+    out_c = mamba_chunk_scan_combined(x_c, dt_c, A_c, B_c, C_c, chunk_size, D=D_c, z=z_c)
+    torch.cuda.synchronize(device)
+
+    assert out.shape == (batch, seqlen, nheads, headdim)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.float(), out_c.float(), rtol=1e-4, atol=1e-4)
+
+    out.sum().backward()
+    out_c.sum().backward()
+    torch.cuda.synchronize(device)
+    grad_pairs = [("x", x, x_c), ("z", z, z_c), ("B", B, B_c), ("C", C, C_c),
+                  ("dt", dt, dt_c), ("A", A, A_c), ("D", D, D_c)]
+    for name, t, t_c in grad_pairs:
+        assert t.grad is not None, f"{name}.grad is None"
+        assert torch.isfinite(t.grad).all(), f"{name}.grad has non-finite values"
+        torch.testing.assert_close(t.grad.float(), t_c.grad.float(), rtol=1e-3, atol=1e-3,
+                                   msg=f"{name}.grad mismatch vs contiguous-equivalent")
+
+
+@gpu_memory_skipif(12)
+def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow_known_answer() -> None:
+    # Known-answer counterpart to the sibling test below, targeting the
+    # same wide, non-contiguous dout (the incoming gradient from autograd
+    # can arrive with an arbitrary, caller-controlled large stride, unlike
+    # x/dt/B/C which we control ourselves). A constant dout = 1 is exactly
+    # the adjoint of out.sum().backward() -- the operating point used by
+    # test_mamba_chunk_scan_combined_bwd_noncontiguous_wide_view_no_overflow_known_answer
+    # above -- so the same closed-form gradients apply here unchanged:
+    #   dC[t]  = nheads * headdim * (t + 1)
+    #   dB[t]  = nheads * headdim * (T - t)
+    #   dx[t]  = dstate * (T - t)
+    #   ddt[t] = headdim * dstate * (T - t)
+    #   dA     = headdim * dstate * (T + 1) * T * (T - 1) / 6
+    # D is set to 0 (not None) so dD gets returned rather than skipped --
+    # 0*x adds nothing to the forward output, so it doesn't disturb the
+    # formulas above, and dD = sum_t(dout * x) = T at this operating point.
+    device = 'cuda'
+
+    batch = 1
+    nheads = 16
+    headdim = 64
+    ngroups = 1
+    dstate = 32
+    chunk_size = 128
+    nchunks = 906
+    seqlen = nchunks * chunk_size
+    parent_width = 18_560
+
+    x = torch.ones(batch, seqlen, nheads, headdim, dtype=torch.float32, device=device)
+    B = torch.ones(batch, seqlen, ngroups, dstate, dtype=torch.float32, device=device)
+    C = torch.ones(batch, seqlen, ngroups, dstate, dtype=torch.float32, device=device)
+    dt = torch.ones(batch, seqlen, nheads, dtype=torch.float32, device=device)
+    A = torch.zeros(nheads, dtype=torch.float32, device=device)
+    D = torch.zeros(nheads, headdim, dtype=torch.float32, device=device)
+
+    out, *_ = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D)
+
+    dout_parent = torch.ones(batch, seqlen, parent_width, dtype=torch.float32, device=device)
+    dout = dout_parent[:, :, -nheads * headdim:].view(batch, seqlen, nheads, headdim)
+    assert not dout.is_contiguous()
+    assert (nchunks - 1) * chunk_size * dout.stride(1) > 2**31 - 1
+
+    dx, ddt, dA, dB, dC, dD, *_ = _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=D)
+    torch.cuda.synchronize(device)
+
+    T = seqlen
+    t = torch.arange(seqlen, dtype=torch.float32, device=device)
+    checks = [
+        ("dC", dC, (nheads * headdim * (t + 1))[None, :, None, None].expand(batch, seqlen, ngroups, dstate)),
+        ("dB", dB, (nheads * headdim * (T - t))[None, :, None, None].expand(batch, seqlen, ngroups, dstate)),
+        ("dx", dx, (dstate * (T - t))[None, :, None, None].expand(batch, seqlen, nheads, headdim)),
+        ("ddt", ddt, (headdim * dstate * (T - t))[None, :, None].expand(batch, seqlen, nheads)),
+        ("dA", dA, torch.full((nheads,), headdim * dstate * (T + 1) * T * (T - 1) / 6, device=device)),
+        ("dD", dD, torch.full((nheads, headdim), float(T), device=device)),
+    ]
+    for name, g, expected in checks:
+        assert torch.isfinite(g).all(), f"{name} has non-finite values"
+        # Same loose relative tolerance as the sibling fwd+bwd known-answer
+        # test above: float32 accumulation roundoff over ~900 chunks, not a
+        # sign of a real bug.
+        torch.testing.assert_close(g.float(), expected, rtol=1e-3, atol=0, msg=f"{name} mismatch")
+
+
+@gpu_memory_skipif(6)
+def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow() -> None:
+    # int64 to avoid int32 overflow, see https://github.com/state-spaces/mamba/issues/1015.
+    # dout is the incoming gradient from autograd, so unlike x/dt/B/C (all
+    # produced internally by our own ops), it can arrive non-contiguous
+    # with an arbitrary, caller-controlled large stride -- e.g. sliced out
+    # of a wider fused gradient tensor upstream.
+    device = 'cuda'
+
+    torch.manual_seed(0)
+    batch = 1
+    nheads = 16
+    headdim = 64
+    ngroups = 1
+    dstate = 32
+    chunk_size = 128
+    nchunks = 906
+    seqlen = nchunks * chunk_size
+    parent_width = 18_560
+
+    x = torch.randn(batch, seqlen, nheads, headdim, dtype=torch.float32, device=device)
+    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=torch.float32, device=device)
+    C = torch.randn(batch, seqlen, ngroups, dstate, dtype=torch.float32, device=device)
+    D = torch.randn(nheads, headdim, dtype=torch.float32, device=device)
+    dt = F.softplus(torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=device) - 4)
+    A = -torch.rand(nheads, dtype=torch.float32, device=device) - 0.01
+
+    out, *_ = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D)
+
+    dout_parent = torch.randn(batch, seqlen, parent_width, dtype=torch.float32, device=device)
+    dout = dout_parent[:, :, -nheads * headdim:].view(batch, seqlen, nheads, headdim)
+    assert not dout.is_contiguous()
+    assert (nchunks - 1) * chunk_size * dout.stride(1) > 2**31 - 1
+    dout_c = dout.contiguous()
+
+    def run(dout_):
+        return _mamba_chunk_scan_combined_bwd(dout_, x, dt, A, B, C, out, chunk_size, D=D)
+
+    dx, ddt, dA, dB, dC, dD, *_ = run(dout)
+    dx_ref, ddt_ref, dA_ref, dB_ref, dC_ref, dD_ref, *_ = run(dout_c)
+    torch.cuda.synchronize(device)
+    # dA/dD are summed over all ~900 chunks; summing in a different order
+    # (contiguous vs. wide-sliced memory layout) causes tiny float roundoff
+    # differences at the ~1e-3 level even for a correct kernel -- same as
+    # the combined test above.
+    tols = {"dA": (1e-3, 1e-3), "dD": (1e-3, 1e-3)}
+    for name, g, g_ref in [("dx", dx, dx_ref), ("ddt", ddt, ddt_ref), ("dA", dA, dA_ref),
+                           ("dB", dB, dB_ref), ("dC", dC, dC_ref), ("dD", dD, dD_ref)]:
+        assert torch.isfinite(g).all(), f"{name} has non-finite values"
+        rtol, atol = tols.get(name, (None, None))
+        torch.testing.assert_close(g, g_ref, rtol=rtol, atol=atol, msg=f"{name} mismatch vs contiguous dout")
+
+
 @gpu_memory_skipif(12)
 def test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow_known_answer() -> None:
     # Known-answer counterpart to the sibling test below, same wide,
