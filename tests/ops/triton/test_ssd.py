@@ -896,6 +896,296 @@ def test_mamba_chunk_scan_combined_bwd_noncontiguous_dout_no_overflow() -> None:
         torch.testing.assert_close(g, g_ref, rtol=rtol, atol=atol, msg=f"{name} mismatch vs contiguous dout")
 
 
+def test_causal_conv1d_bwd_dx_given_ensure_stride_copy_path() -> None:
+    # MambaSplitConv1dScanCombinedFn.backward passes
+    # dx=rearrange(ensure_stride(dxBC_given), "b s d -> b d s") directly into
+    # causal_conv1d_bwd_function, then detects+repairs any aliasing break via
+    # a stride-comparison-and-copy afterward. This exercises the repair path:
+    # force ensure_stride(dxBC_given) to return a copy (rather than a view)
+    # via a monkeypatched impossible _UINT32_MAX (not real overflow scale --
+    # see test_causal_conv1d_bwd_dx_given_wide_batch_stride_no_overflow for
+    # that), and confirm the if/else correctly detects and repairs it against
+    # a ground-truth reference (an ordinary, unsliced dx).
+    device = 'cuda'
+    torch.manual_seed(0)
+
+    batch, dim, seqlen, width = 2, 16, 64, 4
+    # x/dout must be genuinely channels-last (via ensure_stride + rearrange),
+    # matching how the real code constructs them -- a plain contiguous x/dout
+    # is NOT representative and can make the kernel reject a channels-last dx
+    # for an unrelated reason (layout mismatch between x and dx).
+    xBC = torch.randn(batch, seqlen, dim, dtype=torch.float32, device=device)
+    x = rearrange(ensure_stride(xBC), "b s d -> b d s")
+    weight = torch.randn(dim, width, dtype=torch.float32, device=device)
+    bias = torch.randn(dim, dtype=torch.float32, device=device)
+    doutBC = torch.randn(batch, seqlen, dim, dtype=torch.float32, device=device)
+    dout = rearrange(ensure_stride(doutBC), "b s d -> b d s")
+
+    dx_ref, *_ = causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, None, False, False)
+    dx_ref_bsd = rearrange(dx_ref, "b d s -> b s d")
+
+    def make_wide_dx_given():
+        # non-contiguous slice of a wider contiguous parent, matching
+        # dxBC_given's real construction as a slice of dzxbcdt.
+        parent = torch.zeros(batch, seqlen, dim * 3, dtype=torch.float32, device=device)
+        given = parent[:, :, :dim]
+        assert not given.is_contiguous()
+        return given
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(ssd_combined, "_UINT32_MAX", -1)  # force ensure_stride to always copy
+
+        dxBC_given = make_wide_dx_given()
+        dx_in = rearrange(ensure_stride(dxBC_given), "b s d -> b d s")
+        assert dx_in.data_ptr() != dxBC_given.data_ptr(), "ensure_stride did not copy as expected"
+        dxBC_given_update, *_ = causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, dx_in, False, False)
+        dxBC_given_update = rearrange(dxBC_given_update, "b d s -> b s d")
+        if dxBC_given.stride() != dxBC_given_update.stride():
+            dxBC_given.copy_(dxBC_given_update)
+        else:
+            dxBC_given = dxBC_given_update
+
+    torch.testing.assert_close(dxBC_given, dx_ref_bsd, msg="copy-path repair diverged from ground truth")
+
+
+@gpu_memory_skipif(25)
+def test_causal_conv1d_bwd_dx_given_wide_batch_stride_no_overflow() -> None:
+    # Real bug, not a hypothetical: dxBC_given is a slice of the wide dzxbcdt tensor,
+    # so it inherits dzxbcdt's batch stride. Passing it directly as the `dx` output
+    # buffer into causal_conv1d_bwd_function, with no protection at all, corrupts the
+    # result at genuine Nemotron scale (batch=4, seqlen=40960, in_proj width=35072)
+    # because (batch - 1) * seqlen * width exceeds 2**32 -- the batch-3 offset wraps
+    # into batch 0 inside the CUDA kernel. See https://github.com/state-spaces/mamba/issues/1015.
+    #
+    # The actual code in MambaSplitConv1dScanCombinedFn.backward passes
+    # ensure_stride(dxBC_given) as `dx`, relying on ensure_stride's own overflow
+    # check to force a protective copy at this scale, then the stride-check-and-repair
+    # to copy that back into dxBC_given. This test proves that reliance is
+    # necessary -- not just a style choice -- by reproducing the corruption directly
+    # against two broken alternatives: passing dxBC_given as `dx` with no
+    # ensure_stride at all, and with ensure_stride but no copy-back repair.
+    device = 'cuda'
+    torch.manual_seed(0)
+
+    batch, seqlen, parent_width, channels, width = 4, 40960, 35072, 8, 4
+    assert (batch - 1) * seqlen * parent_width > 2**32 - 1
+
+    x_small = torch.randn(batch, seqlen, channels, device=device)
+    x = rearrange(ensure_stride(x_small), "b s d -> b d s")
+    weight = torch.randn(channels, width, device=device)
+    bias = torch.randn(channels, device=device)
+    dout_small = torch.randn(batch, seqlen, channels, device=device)
+    dout = rearrange(ensure_stride(dout_small), "b s d -> b d s")
+
+    dx_ref, *_ = causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, None, False, False)
+    dx_ref_bsd = rearrange(dx_ref, "b d s -> b s d").clone()
+
+    def make_wide_dx_given():
+        # non-contiguous slice of a much wider contiguous parent, matching
+        # dxBC_given's real construction as a slice of dzxbcdt.
+        parent = torch.zeros(batch, seqlen, parent_width, device=device)
+        given = parent[:, :, :channels]
+        assert not given.is_contiguous()
+        max_offset = sum((size - 1) * stride for size, stride in zip(given.shape, given.stride()))
+        assert max_offset > 2**32 - 1
+        return given
+
+    # Current code's approach: ensure_stride(dxBC_given) as dx, with the stride-check-and-repair.
+    dxBC_given_current = make_wide_dx_given()
+    dx_in_current = rearrange(ensure_stride(dxBC_given_current), "b s d -> b d s")
+    dxBC_given_update, *_ = causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, dx_in_current, False, False)
+    dxBC_given_update = rearrange(dxBC_given_update, "b d s -> b s d")
+    if dxBC_given_current.stride() != dxBC_given_update.stride():
+        dxBC_given_current.copy_(dxBC_given_update)
+    else:
+        dxBC_given_current = dxBC_given_update
+    torch.testing.assert_close(dxBC_given_current, dx_ref_bsd,
+                               msg="current code (ensure_stride(dxBC_given) as dx + repair) corrupted at genuine overflow scale")
+    del dxBC_given_current, dx_in_current, dxBC_given_update
+
+    # Naive alternative: dx=dxBC_given directly, no ensure_stride at all.
+    dxBC_given_naive = make_wide_dx_given()
+    dx_in_naive = rearrange(dxBC_given_naive, "b s d -> b d s")
+    causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, dx_in_naive, False, False)
+    assert (dxBC_given_naive - dx_ref_bsd).abs().max().item() > 1.0, \
+        "expected the naive dx=dxBC_given approach (no ensure_stride) to actually corrupt at this scale"
+    del dxBC_given_naive, dx_in_naive
+
+    # ensure_stride(dxBC_given) as dx, but no copy-back repair at all.
+    dxBC_given_no_repair = make_wide_dx_given()
+    dx_in_no_repair = rearrange(ensure_stride(dxBC_given_no_repair), "b s d -> b d s")
+    causal_conv1d_bwd_function(x, weight, bias, dout, None, None, None, dx_in_no_repair, False, False)
+    assert (dxBC_given_no_repair - dx_ref_bsd).abs().max().item() > 1.0, \
+        "expected ensure_stride(dxBC_given) as dx with no copy-back repair to actually corrupt at this scale"
+
+
+def test_mamba_split_conv1d_scan_combined_bwd_ensure_stride_copy_path() -> None:
+    # The test above exercises ensure_stride's copy path against the bare
+    # causal_conv1d_bwd_function primitive directly -- it never runs through
+    # MambaSplitConv1dScanCombinedFn.backward() itself (the dxBC_given
+    # stride-check-and-repair around causal_conv1d_bwd_function, see
+    # https://github.com/state-spaces/mamba/issues/1015), so it doesn't prove that *that* code, as
+    # actually invoked by autograd, is unaffected by ensure_stride returning
+    # a copy instead of a view. Force the copy path (as above, via the same
+    # _UINT32_MAX monkeypatch -- not real overflow scale) and compare
+    # gradients against an unpatched run (the common case: ensure_stride
+    # passes dxBC_given straight through) of the exact same real backward path.
+    device = 'cuda'
+    torch.manual_seed(0)
+    batch, nheads, headdim, ngroups, dstate, chunk_size, seqlen = 2, 4, 32, 2, 16, 64, 256
+    dim = nheads * headdim
+    width_conv1d = dim + 2 * ngroups * dstate
+    conv_width = 4
+
+    def run(force_copy):
+        torch.manual_seed(0)
+        zxbcdt = torch.randn(batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads,
+                             device=device, requires_grad=True)
+        conv1d_weight = torch.randn(width_conv1d, conv_width, device=device)
+        conv1d_bias = torch.randn(width_conv1d, device=device)
+        dt_bias = torch.randn(nheads, device=device)
+        A = -torch.rand(nheads, device=device) - 0.01
+        D = torch.randn(nheads, headdim, device=device)
+        with pytest.MonkeyPatch.context() as mp:
+            if force_copy:
+                mp.setattr(ssd_combined, "_UINT32_MAX", -1)
+            out = mamba_split_conv1d_scan_combined(
+                zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, ngroups=ngroups)
+            out.sum().backward()
+        torch.cuda.synchronize(device)
+        return out.detach().clone(), zxbcdt.grad.clone()
+
+    out_copy, grad_copy = run(force_copy=True)
+    out_view, grad_view = run(force_copy=False)
+
+    assert torch.isfinite(grad_copy).all()
+    torch.testing.assert_close(out_copy, out_view, msg="forward output changed by forcing ensure_stride's copy path")
+    torch.testing.assert_close(grad_copy, grad_view, msg="backward gradient changed by forcing ensure_stride's copy path")
+
+
+@gpu_memory_skipif(26)
+def test_mamba_split_conv1d_scan_combined_fwd_noncontiguous_no_overflow_known_answer() -> None:
+    # Known-answer counterpart to the sibling test below, same real
+    # (not artificially injected) non-contiguous x/B/C split. Two knobs
+    # make the whole pipeline closed-form instead of just isfinite:
+    #
+    # 1. conv1d_weight's last tap = 1 (rest 0), bias = 0, activation=None
+    #    (passed to causal_conv1d_fn) makes the causal conv an exact
+    #    identity -- verified directly against causal_conv1d_fn beforehand.
+    #    So xBC_conv == the raw xBC we write into zxbcdt.
+    # 2. dt_softplus is hardcoded True inside this function, so instead of
+    #    fighting that, dt (pre-softplus) = 1 with dt_bias = 0 gives a
+    #    known dt_after = softplus(1) (computed via the same
+    #    F.softplus primitive, not the kernel under test).
+    #
+    # With x = B = C = 1 (post-"conv"), A = 0, D = 0: this is exactly the
+    # A=0/dt=x=B=C=1 recurrence from the mamba_chunk_scan_combined
+    # known-answer test above, scaled by dt_after instead of 1:
+    #   out_x[t] = dstate * dt_after * (t + 1)
+    # z is not conv'd at all (split raw from zxbcdt), so setting z to a
+    # constant z_const gates the whole thing by a known F.silu(z_const):
+    #   out[t] = out_x[t] * F.silu(z_const)
+    device = 'cuda'
+
+    batch = 1
+    nheads = 289
+    headdim = 64
+    ngroups = 1
+    dstate = 32
+    dim = nheads * headdim
+    chunk_size = 128
+    nchunks = 906
+    seqlen = nchunks * chunk_size
+    conv_width = 4
+
+    width_conv1d = dim + 2 * ngroups * dstate
+    assert width_conv1d == 18_560
+
+    z_const = 2.0
+    dt_raw_val = 1.0
+
+    zxbcdt = torch.zeros(batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads,
+                         dtype=torch.bfloat16, device=device)
+    z_part, xbc_part, dt_part = torch.split(zxbcdt, [dim, width_conv1d, nheads], dim=-1)
+    z_part.fill_(z_const)
+    xbc_part.fill_(1.0)
+    dt_part.fill_(dt_raw_val)
+    assert not xbc_part.is_contiguous()  # real torch.split() view, not an injected wide slice
+
+    conv1d_weight = torch.zeros(width_conv1d, conv_width, dtype=torch.bfloat16, device=device)
+    conv1d_weight[:, -1] = 1.0  # identity tap, verified directly against causal_conv1d_fn
+    conv1d_bias = torch.zeros(width_conv1d, dtype=torch.bfloat16, device=device)
+    dt_bias = torch.zeros(nheads, dtype=torch.float32, device=device)
+    A = torch.zeros(nheads, dtype=torch.float32, device=device)
+    D = torch.zeros(nheads, headdim, dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        out = mamba_split_conv1d_scan_combined(
+            zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, activation=None)
+    torch.cuda.synchronize(device)
+
+    assert out.shape == (batch, seqlen, dim)
+    dt_after = F.softplus(torch.tensor(dt_raw_val, device=device))
+    silu_z = F.silu(torch.tensor(z_const, device=device))
+    t = torch.arange(seqlen, dtype=torch.float32, device=device)
+    expected_col = dstate * dt_after * (t + 1) * silu_z  # (seqlen,) -- same for every dim column
+    # Compare a single column, not the full (seqlen, dim) tensor: the
+    # comparison itself (not the forward pass) OOMs at the full width on a
+    # 48 GiB GPU once both the actual and expected tensors materialize, and
+    # every column is identical by construction anyway -- this still
+    # exercises addressing across the full overflow-triggering seqlen axis.
+    torch.testing.assert_close(out[0, :, 0].float(), expected_col, rtol=1e-2, atol=0)
+    # Also spot-check a few other columns/heads to confirm the uniformity
+    # assumption itself (not just column 0) at negligible extra memory cost.
+    for col in (1, dim // 2, dim - 1):
+        torch.testing.assert_close(out[0, :, col].float(), expected_col, rtol=1e-2, atol=0)
+
+
+@gpu_memory_skipif(25)
+def test_mamba_split_conv1d_scan_combined_fwd_noncontiguous_no_overflow() -> None:
+    # int64 to avoid int32 overflow, see https://github.com/state-spaces/mamba/issues/1015.
+    # x/B/C are non-contiguous here not via an artificial wide-slice trick
+    # but for real: causal_conv1d's output (xBC_conv) is contiguous, and
+    # x/B/C are plain torch.split() views of it along the last dim -- the
+    # same "large stride(1)" pattern as elsewhere in this file, except this
+    # one arises unavoidably on every real call. Sized at realistic
+    # Nemotron-scale in_proj width (dim + 2*ngroups*dstate = 18,560) so the
+    # split's stride(1) alone exceeds the int32 threshold over ~900 chunks.
+    device = 'cuda'
+
+    torch.manual_seed(0)
+    batch = 1
+    # small dstate: the intermediate `states` tensor scales with
+    # nheads * headdim * dstate * nchunks, so most of width_conv1d needs to
+    # come from dim (nheads * headdim), not dstate, to keep memory down.
+    nheads = 289
+    headdim = 64
+    ngroups = 1
+    dstate = 32
+    dim = nheads * headdim
+    chunk_size = 128
+    nchunks = 906
+    seqlen = nchunks * chunk_size
+    conv_width = 4
+
+    width_conv1d = dim + 2 * ngroups * dstate
+    assert width_conv1d == 18_560
+
+    zxbcdt = torch.randn(batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads,
+                         dtype=torch.bfloat16, device=device)
+    conv1d_weight = torch.randn(width_conv1d, conv_width, dtype=torch.bfloat16, device=device)
+    conv1d_bias = torch.randn(width_conv1d, dtype=torch.bfloat16, device=device)
+    dt_bias = torch.randn(nheads, dtype=torch.float32, device=device)
+    A = -torch.rand(nheads, dtype=torch.float32, device=device) - 0.01
+    D = torch.randn(nheads, headdim, dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        out = mamba_split_conv1d_scan_combined(
+            zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size)
+        torch.cuda.synchronize(device)
+        assert torch.isfinite(out).all()
+
+
 @gpu_memory_skipif(12)
 def test_state_passing_fwd_bwd_noncontiguous_dA_chunk_cumsum_no_overflow_known_answer() -> None:
     # Known-answer counterpart to the sibling test below, same wide,
